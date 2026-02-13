@@ -1,6 +1,6 @@
 [project]
 name = "vel-harness"
-version = "0.1.0"
+version = "0.1.1"
 description = "Deep agent harness for data, decisions, and research"
 readme = "README.md"
 license = { text = "MIT" }
@@ -50,11 +50,11 @@ Documentation = "https://github.com/example/vel-harness#readme"
 Repository = "https://github.com/example/vel-harness"
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
-[tool.hatch.build.targets.wheel]
-packages = ["vel_harness", "valis_cli"]
+[tool.setuptools.packages.find]
+include = ["vel_harness*", "valis_cli*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
