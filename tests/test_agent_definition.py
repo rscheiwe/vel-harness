@@ -361,7 +361,7 @@ class TestAgentRegistryBothFormats:
         assert registry.has_agent("config-agent")
         assert registry.has_agent("defn-agent")
         assert registry.has_agent("dict-agent")
-        assert len(registry) == 6  # 3 default + 3 custom
+        assert len(registry) == 10  # 7 default + 3 custom
 
 
 # --- VelHarness Integration Tests ---

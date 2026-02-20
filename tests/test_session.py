@@ -217,6 +217,26 @@ class TestQuery:
         assert collected == []
 
 
+class TestRoleWorkflow:
+    """Tests for session-level role workflow helper."""
+
+    @pytest.mark.asyncio
+    async def test_run_role_workflow_passes_session_id(self):
+        """Session helper should call harness workflow with the current session id."""
+        harness = make_mock_harness()
+        harness.run_role_workflow = AsyncMock(return_value={"status": "completed"})
+        session = HarnessSession(harness=harness, session_id="abc123")
+
+        out = await session.run_role_workflow("Improve reliability", include_critic=False)
+
+        assert out["status"] == "completed"
+        harness.run_role_workflow.assert_called_once_with(
+            goal="Improve reliability",
+            session_id="abc123",
+            include_critic=False,
+        )
+
+
 # --- run() Non-Streaming Tests ---
 
 

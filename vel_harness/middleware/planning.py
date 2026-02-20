@@ -197,6 +197,13 @@ Always create a plan before starting complex work.
                 category="planning",
                 tags=["planning", "tracking"],
             ),
+            ToolSpec.from_function(
+                self.read_todos,
+                name="read_todos",
+                description="Read the current todo list and progress summary.",
+                category="planning",
+                tags=["planning", "tracking", "read"],
+            ),
         ]
 
     def write_todos(
@@ -272,6 +279,17 @@ Always create a plan before starting complex work.
             "todo_list": self.todo_list.to_markdown(),
         }
 
+    def read_todos(self) -> Dict[str, Any]:
+        """Read the current todo list state."""
+        return {
+            "current_task": self.todo_list.current_task,
+            "pending_count": len(self.todo_list.get_pending()),
+            "in_progress_count": len(self.todo_list.get_in_progress()),
+            "completed_count": len(self.todo_list.get_completed()),
+            "blocked_count": len(self.todo_list.get_blocked()),
+            "todo_list": self.todo_list.to_markdown(),
+        }
+
     def get_system_prompt_segment(self) -> str:
         """Return system prompt segment for planning."""
         return """
@@ -284,6 +302,13 @@ You have a `write_todos` tool for planning and tracking complex tasks.
 - When you need to break down a complex request
 - To track progress on ongoing work
 - When you need to adapt your approach based on new information
+- For coding tasks that involve edits, tests, or subagent delegation
+
+**Non-optional expectation for complex coding work:**
+- Start with `write_todos` before significant edits or delegation
+- Keep at most one item `in_progress` at a time
+- Update todos after each major milestone (tests run, files updated, verification done)
+- Use `read_todos` before final answer to ensure completion/blocked status is explicit
 
 **How to plan effectively:**
 1. Start by identifying the high-level goal

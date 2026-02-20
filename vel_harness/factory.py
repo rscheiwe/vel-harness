@@ -17,8 +17,11 @@ DEPRECATION NOTICE:
         result = await harness.run("Hello")
 """
 
+import json
 import tempfile
 import warnings
+import contextvars
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -41,11 +44,37 @@ from vel_harness.middleware.context import (
     ContextConfig as CtxConfig,
 )
 from vel_harness.middleware.memory import MemoryMiddleware
-from vel_harness.backends.database import DatabaseConfig, MockDatabaseBackend
+from vel_harness.middleware.local_context import LocalContextMiddleware
+from vel_harness.middleware.loop_detection import LoopDetectionMiddleware
+from vel_harness.middleware.verification import VerificationMiddleware
+from vel_harness.middleware.tracing import TracingMiddleware
+from vel_harness.middleware.time_budget import TimeBudgetMiddleware
+from vel_harness.middleware.run_guard import RunGuardMiddleware, RunGuardConfig as RuntimeRunGuardConfig
+from vel_harness.backends.database import (
+    DatabaseBackend,
+    DatabaseConfig,
+    DatabaseNotAvailableError,
+    MockDatabaseBackend,
+)
 from vel_harness.backends.composite import CompositeBackend, PersistentStoreBackend
 from vel_harness.backends.state import StateFilesystemBackend
 from vel_harness.backends.real import RealFilesystemBackend
 from vel_harness.prompts import compose_system_prompt, compose_agent_prompt
+from vel_harness.reasoning_scheduler import (
+    ReasoningScheduler,
+    ReasoningSchedulerConfig as RuntimeReasoningSchedulerConfig,
+)
+
+
+_active_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "vel_harness_active_session_id",
+    default="",
+)
+
+_TODO_NUDGE_RE = re.compile(
+    r"\b(implement|fix|bug|refactor|code|function|test|suite|compile|build|workflow|subagent|parallel)\b",
+    flags=re.IGNORECASE,
+)
 
 
 class DeepAgent:
@@ -98,6 +127,14 @@ class DeepAgent:
         self._agent = agent
         self._middlewares = middlewares
         self._checkpoint_manager = None
+        self._reasoning_scheduler = ReasoningScheduler(
+            RuntimeReasoningSchedulerConfig(
+                enabled=config.reasoning_scheduler.enabled,
+                planning_budget_tokens=config.reasoning_scheduler.planning_budget_tokens,
+                build_budget_tokens=config.reasoning_scheduler.build_budget_tokens,
+                verify_budget_tokens=config.reasoning_scheduler.verify_budget_tokens,
+            )
+        )
 
     @property
     def config(self) -> DeepAgentConfig:
@@ -157,6 +194,36 @@ class DeepAgent:
     def memory(self) -> Optional[MemoryMiddleware]:
         """Get memory middleware."""
         return self._middlewares.get("memory")  # type: ignore
+
+    @property
+    def local_context(self) -> Optional[LocalContextMiddleware]:
+        """Get local context middleware."""
+        return self._middlewares.get("local_context")  # type: ignore
+
+    @property
+    def loop_detection(self) -> Optional[LoopDetectionMiddleware]:
+        """Get loop detection middleware."""
+        return self._middlewares.get("loop_detection")  # type: ignore
+
+    @property
+    def verification(self) -> Optional[VerificationMiddleware]:
+        """Get verification middleware."""
+        return self._middlewares.get("verification")  # type: ignore
+
+    @property
+    def tracing(self) -> Optional[TracingMiddleware]:
+        """Get tracing middleware."""
+        return self._middlewares.get("tracing")  # type: ignore
+
+    @property
+    def time_budget(self) -> Optional[TimeBudgetMiddleware]:
+        """Get time budget middleware."""
+        return self._middlewares.get("time_budget")  # type: ignore
+
+    @property
+    def run_guard(self) -> Optional[RunGuardMiddleware]:
+        """Get runtime guard middleware."""
+        return self._middlewares.get("run_guard")  # type: ignore
 
     @property
     def checkpoint_manager(self) -> Optional[Any]:
@@ -223,20 +290,87 @@ class DeepAgent:
         Returns:
             Agent response
         """
-        # Process context for skill activation (text content only)
-        if self.skills:
-            if isinstance(input_text, str):
-                self.skills.process_context(input_text)
-            elif isinstance(input_text, list):
-                text_parts = [p.get('text', '') for p in input_text if p.get('type') == 'text']
-                self.skills.process_context(' '.join(text_parts))
+        sid = session_id or "default"
+        self._process_skill_context(input_text)
+        await self._preprocess_context_window(sid)
+        if self.time_budget is not None:
+            self.time_budget.start(sid)
+        if self.run_guard is not None:
+            self.run_guard.start(sid)
 
-        # Run underlying agent
-        # Use 'message' key which vel expects (not 'text')
-        return await self._agent.run(
-            {"message": input_text, **(context or {})},
-            session_id=session_id,
-        )
+        run_ctx = None
+        if self.tracing is not None:
+            run_ctx = self.tracing.start_run(session_id=sid)
+
+        enriched_input = self._inject_local_context(input_text, sid)
+        enriched_input = self._apply_time_budget_hint(enriched_input, sid)
+        enriched_input = self._apply_run_guard_hint(enriched_input, sid)
+        enriched_input = self._apply_todo_hint(enriched_input, sid)
+        loop_hint = self._get_loop_hint(sid)
+        if loop_hint:
+            enriched_input = self._append_hint_to_input(enriched_input, loop_hint)
+
+        if self.time_budget is not None and self.time_budget.should_pivot_to_verify(sid):
+            self._apply_reasoning_phase("verify")
+        else:
+            self._apply_reasoning_phase("build")
+
+        token = _active_session_id.set(sid)
+        final_output_preview = ""
+        try:
+            response = await self._agent.run(
+                {"message": enriched_input, **(context or {})},
+                session_id=sid,
+            )
+
+            response = await self._maybe_verification_followup(
+                response=response,
+                original_input=input_text,
+                session_id=sid,
+                context=context,
+            )
+            final_output_preview = self._preview_response_output(response)
+            if self.tracing is not None:
+                self.tracing.record(
+                    "assistant-final",
+                    {"stage": "final", "output_preview": final_output_preview},
+                )
+        finally:
+            _active_session_id.reset(token)
+            await self._postprocess_context_window(sid)
+            if self.tracing is not None:
+                self.tracing.end_run(
+                    success=True,
+                    data={
+                        "run_id": (run_ctx or {}).get("run_id", ""),
+                        "final_output_preview": final_output_preview,
+                    },
+                )
+
+        # In prompted reasoning mode, strip internal thinking tags from
+        # non-streaming responses as a safety fallback.
+        reasoning_cfg = self._config.reasoning
+        if (
+            reasoning_cfg is not None
+            and getattr(reasoning_cfg, "mode", None) == "prompted"
+            and (hasattr(response, "content") or isinstance(response, str))
+        ):
+            from vel_harness.reasoning import PromptedReasoningParser
+
+            parser = PromptedReasoningParser(reasoning_cfg)
+            response_text = response.content if hasattr(response, "content") else response
+            events = parser.feed(response_text or "") + parser.finish()
+            text = "".join(
+                e.get("delta", "")
+                for e in events
+                if isinstance(e, dict) and e.get("type") == "text-delta"
+            )
+            if hasattr(response, "content"):
+                response.content = text or response.content
+            else:
+                response = text or response
+
+        return response
 
     async def run_stream(
         self,
@@ -256,22 +390,455 @@ class DeepAgent:
         Yields:
             Stream events from the agent
         """
-        # Process context for skill activation (text content only)
-        if self.skills:
-            if isinstance(input_text, str):
-                self.skills.process_context(input_text)
-            elif isinstance(input_text, list):
-                # Extract text from content parts for skill processing
-                text_parts = [p.get('text', '') for p in input_text if p.get('type') == 'text']
-                self.skills.process_context(' '.join(text_parts))
+        sid = session_id or "default"
+        self._process_skill_context(input_text)
+        await self._preprocess_context_window(sid)
+        if self.time_budget is not None:
+            self.time_budget.start(sid)
+        if self.run_guard is not None:
+            self.run_guard.start(sid)
+
+        reasoning_cfg = self._config.reasoning
+        parser = None
+        if reasoning_cfg is not None and getattr(reasoning_cfg, "mode", None) == "prompted":
+            from vel_harness.reasoning import PromptedReasoningParser
+
+            parser = PromptedReasoningParser(reasoning_cfg)
+
+        run_ctx = None
+        if self.tracing is not None:
+            run_ctx = self.tracing.start_run(session_id=sid)
+
+        enriched_input = self._inject_local_context(input_text, sid)
+        enriched_input = self._apply_time_budget_hint(enriched_input, sid)
+        enriched_input = self._apply_run_guard_hint(enriched_input, sid)
+        enriched_input = self._apply_todo_hint(enriched_input, sid)
+        loop_hint = self._get_loop_hint(sid)
+        if loop_hint:
+            enriched_input = self._append_hint_to_input(enriched_input, loop_hint)
+
+        if self.time_budget is not None and self.time_budget.should_pivot_to_verify(sid):
+            self._apply_reasoning_phase("verify")
+        else:
+            self._apply_reasoning_phase("build")
 
         # Run underlying agent with streaming
         # Use 'message' key which vel expects (not 'text')
-        async for event in self._agent.run_stream(
-            {"message": input_text, **(context or {})},
+        stream_finished = False
+        buffered_events: List[Any] = []
+        final_output_chunks: List[str] = []
+        budget_hint_emitted = False
+
+        def _capture_chunk(ev: Any) -> None:
+            chunk = self._extract_stream_text_chunk(ev)
+            if not chunk:
+                return
+            final_output_chunks.append(chunk)
+
+        try:
+            token = _active_session_id.set(sid)
+            async for event in self._agent.run_stream(
+                {"message": enriched_input, **(context or {})},
+                session_id=sid,
+            ):
+                if isinstance(event, dict):
+                    event = self._process_context_tool_event(event)
+
+                if parser is not None and isinstance(event, dict):
+                    event_type = event.get("type")
+                    if event_type == "text-delta":
+                        deltas = parser.feed(event.get("delta", ""))
+                        for parsed_event in self._filter_reasoning_events(deltas, reasoning_cfg):
+                            _capture_chunk(parsed_event)
+                            if self.tracing is not None and isinstance(parsed_event, dict):
+                                self.tracing.record_stream_event(sid, parsed_event)
+                            buffered_events.append(parsed_event)
+                        continue
+                    if event_type == "finish":
+                        stream_finished = True
+                        trailing = parser.finish()
+                        for parsed_event in self._filter_reasoning_events(trailing, reasoning_cfg):
+                            _capture_chunk(parsed_event)
+                            if self.tracing is not None and isinstance(parsed_event, dict):
+                                self.tracing.record_stream_event(sid, parsed_event)
+                            buffered_events.append(parsed_event)
+                        if self.tracing is not None and isinstance(event, dict):
+                            self.tracing.record_stream_event(sid, event)
+                        buffered_events.append(event)
+                        continue
+
+                if self.tracing is not None and isinstance(event, dict):
+                    self.tracing.record_stream_event(sid, event)
+                _capture_chunk(event)
+                buffered_events.append(event)
+                if not budget_hint_emitted and self.time_budget is not None:
+                    hint = self.time_budget.get_runtime_hint(sid)
+                    if hint:
+                        budget_hint_emitted = True
+                        if self.tracing is not None:
+                            self.tracing.record("time-budget-hint", {"session_id": sid, "hint": hint})
+                        buffered_events.append(
+                            {
+                                "type": "status",
+                                "status": "time-budget",
+                                "message": hint,
+                            }
+                        )
+
+            if parser is not None and not stream_finished:
+                trailing = parser.finish()
+                for parsed_event in self._filter_reasoning_events(trailing, reasoning_cfg):
+                    _capture_chunk(parsed_event)
+                    if self.tracing is not None and isinstance(parsed_event, dict):
+                        self.tracing.record_stream_event(sid, parsed_event)
+                    buffered_events.append(parsed_event)
+
+            followup_needed = False
+            followup_reason = ""
+            if self.verification is not None and isinstance(input_text, str):
+                followup_needed, followup_reason = self.verification.should_followup(
+                    sid,
+                    user_message=input_text,
+                )
+            rg_followup_needed = False
+            rg_followup_reason = ""
+            if self.run_guard is not None and isinstance(input_text, str):
+                rg_followup_needed, rg_followup_reason = self.run_guard.should_force_followup(
+                    session_id=sid,
+                    user_message=input_text,
+                    response="",
+                )
+
+            if followup_needed or rg_followup_needed:
+                if followup_needed and self.verification is not None:
+                    self.verification.mark_followup_used(sid)
+                if self.tracing is not None:
+                    self.tracing.record(
+                        "verification-followup-required",
+                        {
+                            "reason": followup_reason if followup_needed else rg_followup_reason,
+                            "session_id": sid,
+                            "source": "verification" if followup_needed else "run_guard",
+                        },
+                    )
+                yield {
+                    "type": "status",
+                    "status": "verification-required",
+                    "message": "Running verification pass before finalizing.",
+                }
+
+                self._apply_reasoning_phase("verify")
+                if followup_needed and self.verification is not None:
+                    followup_prompt = self.verification.build_followup_prompt(followup_reason)
+                else:
+                    followup_prompt = (
+                        self.run_guard.build_followup_prompt(rg_followup_reason)
+                        if self.run_guard is not None
+                        else "Run an additional verification pass."
+                    )
+                async for event in self._agent.run_stream(
+                    {"message": followup_prompt, **(context or {})},
+                    session_id=sid,
+                ):
+                    if isinstance(event, dict):
+                        event = self._process_context_tool_event(event)
+                    if self.tracing is not None and isinstance(event, dict):
+                        self.tracing.record_stream_event(sid, event)
+                    _capture_chunk(event)
+                    yield event
+            else:
+                for event in buffered_events:
+                    yield event
+        finally:
+            _active_session_id.reset(token)
+            await self._postprocess_context_window(sid)
+            if self.tracing is not None:
+                self.tracing.end_run(
+                    success=True,
+                    data={
+                        "run_id": (run_ctx or {}).get("run_id", ""),
+                        "final_output_preview": "".join(final_output_chunks)[:6000],
+                    },
+                )
+
+    def _process_skill_context(
+        self,
+        input_text: Union[str, List[Dict[str, Any]]],
+    ) -> None:
+        """Process user input for skill auto-activation."""
+        if not self.skills:
+            return
+
+        if isinstance(input_text, str):
+            self.skills.process_context(input_text)
+            return
+
+        text_parts = [p.get("text", "") for p in input_text if p.get("type") == "text"]
+        self.skills.process_context(" ".join(text_parts))
+
+    def _preview_response_output(self, response: Any, max_chars: int = 6000) -> str:
+        """Extract and truncate a response text preview for tracing."""
+        text = ""
+        if response is None:
+            return text
+        if hasattr(response, "content"):
+            text = str(getattr(response, "content") or "")
+        elif isinstance(response, dict):
+            text = str(response.get("content", "") or "")
+        else:
+            text = str(response)
+        if len(text) <= max_chars:
+            return text
+        return f"{text[:max_chars]}...<truncated>"
+
+    def _extract_stream_text_chunk(self, event: Any) -> str:
+        """Extract text content from a streamed event for final output preview."""
+        if isinstance(event, dict):
+            if event.get("type") == "text-delta":
+                return str(event.get("delta", ""))
+            if event.get("type") == "assistant-message":
+                return str(event.get("content", ""))
+            if "content" in event and isinstance(event.get("content"), str):
+                return str(event.get("content", ""))
+            return ""
+        if hasattr(event, "content"):
+            return str(getattr(event, "content") or "")
+        return ""
+
+    def _process_context_tool_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply context tool-result truncation to stream events."""
+        if self.context is None:
+            return event
+
+        if event.get("type") != "tool-output-available":
+            return event
+
+        output = event.get("output")
+        if output is None:
+            return event
+
+        if isinstance(output, str):
+            output_text = output
+        else:
+            try:
+                output_text = json.dumps(output, default=str)
+            except Exception:
+                output_text = str(output)
+
+        truncated = self.context.process_tool_result(
+            output_text,
+            tool_name=str(event.get("toolName", "unknown")),
+            tool_call_id=str(event.get("toolCallId", "")),
+        )
+
+        if truncated != output_text:
+            return {**event, "output": truncated}
+        return event
+
+    async def _preprocess_context_window(self, session_id: Optional[str]) -> None:
+        """Apply proactive context compaction before a run."""
+        if self.context is None or not session_id:
+            return
+
+        ctxmgr = getattr(self._agent, "ctxmgr", None)
+        if ctxmgr is None or not hasattr(ctxmgr, "get_session_context"):
+            return
+
+        try:
+            messages = ctxmgr.get_session_context(session_id)
+            processed = await self.context.process_messages(
+                messages,
+                model=self._config.model.model,
+                session_id=session_id,
+            )
+            if hasattr(ctxmgr, "set_session_context"):
+                ctxmgr.set_session_context(session_id, processed)
+        except Exception:
+            pass
+
+    async def _postprocess_context_window(self, session_id: Optional[str]) -> None:
+        """Evict historical tool outputs after a run."""
+        if self.context is None or not session_id:
+            return
+
+        ctxmgr = getattr(self._agent, "ctxmgr", None)
+        if ctxmgr is None or not hasattr(ctxmgr, "get_session_context"):
+            return
+
+        try:
+            messages = ctxmgr.get_session_context(session_id)
+            processed = await self.context.after_assistant_response(messages)
+            if hasattr(ctxmgr, "set_session_context"):
+                ctxmgr.set_session_context(session_id, processed)
+        except Exception:
+            pass
+
+    def _filter_reasoning_events(
+        self,
+        events: List[Dict[str, Any]],
+        reasoning_cfg: Any,
+    ) -> List[Dict[str, Any]]:
+        """Filter reasoning events based on stream_reasoning setting."""
+        if getattr(reasoning_cfg, "stream_reasoning", True):
+            return events
+        return [e for e in events if e.get("type") == "text-delta"]
+
+    def _inject_local_context(
+        self,
+        input_text: Union[str, List[Dict[str, Any]]],
+        session_id: str,
+    ) -> Union[str, List[Dict[str, Any]]]:
+        """Inject deterministic local context summary once per session."""
+        if self.local_context is None:
+            return input_text
+        if self.local_context.has_injected(session_id):
+            return input_text
+
+        summary = self.local_context.build_injection(session_id)
+        if not summary:
+            return input_text
+        if self.tracing is not None:
+            self.tracing.record("local-context-injected", {"session_id": session_id})
+
+        prefix = f"{summary}\n\nUse this environment context when planning and verification.\n\n"
+        if isinstance(input_text, str):
+            return prefix + input_text
+        return [{"type": "text", "text": prefix}] + input_text
+
+    def _get_loop_hint(self, session_id: str) -> Optional[str]:
+        if self.loop_detection is None:
+            return None
+        hint = self.loop_detection.get_recovery_hint(session_id)
+        if hint and self.tracing is not None:
+            self.tracing.record("loop-recovery-hint", {"session_id": session_id, "hint": hint})
+        return hint
+
+    def _append_hint_to_input(
+        self,
+        input_text: Union[str, List[Dict[str, Any]]],
+        hint: str,
+    ) -> Union[str, List[Dict[str, Any]]]:
+        if isinstance(input_text, str):
+            return f"{input_text}\n\n[Loop recovery hint]\n{hint}"
+        return input_text + [{"type": "text", "text": f"\n\n[Loop recovery hint]\n{hint}"}]
+
+    def _apply_time_budget_hint(
+        self,
+        input_text: Union[str, List[Dict[str, Any]]],
+        session_id: str,
+    ) -> Union[str, List[Dict[str, Any]]]:
+        if self.time_budget is None:
+            return input_text
+        hint = self.time_budget.get_runtime_hint(session_id)
+        if not hint:
+            return input_text
+        if self.tracing is not None:
+            self.tracing.record(
+                "time-budget-hint",
+                {"session_id": session_id, "hint": hint},
+            )
+        if isinstance(input_text, str):
+            return f"{input_text}\n\n[Time budget hint]\n{hint}"
+        return input_text + [{"type": "text", "text": f"\n\n[Time budget hint]\n{hint}"}]
+
+    def _apply_run_guard_hint(
+        self,
+        input_text: Union[str, List[Dict[str, Any]]],
+        session_id: str,
+    ) -> Union[str, List[Dict[str, Any]]]:
+        if self.run_guard is None:
+            return input_text
+        hint = self.run_guard.get_runtime_hint(session_id)
+        if not hint:
+            return input_text
+        if self.tracing is not None:
+            self.tracing.record("run-guard-hint", {"session_id": session_id, "hint": hint})
+        if isinstance(input_text, str):
+            return f"{input_text}\n\n[RunGuard hint]\n{hint}"
+        return input_text + [{"type": "text", "text": f"\n\n[RunGuard hint]\n{hint}"}]
+
+    def _apply_todo_hint(
+        self,
+        input_text: Union[str, List[Dict[str, Any]]],
+        session_id: str,
+    ) -> Union[str, List[Dict[str, Any]]]:
+        if self.planning is None:
+            return input_text
+        if not isinstance(input_text, str):
+            return input_text
+        if self.planning.todo_list.items:
+            return input_text
+        if not _TODO_NUDGE_RE.search(input_text):
+            return input_text
+        hint = (
+            "Before substantial implementation or multi-step delegation, call write_todos "
+            "to create a concise 3-6 step plan, then keep it updated with completed/in_progress."
+        )
+        if self.tracing is not None:
+            self.tracing.record("planning-todo-hint", {"session_id": session_id, "hint": hint})
+        return f"{input_text}\n\n[Planning hint]\n{hint}"
+
+    def _apply_reasoning_phase(self, phase: str) -> None:
+        """Apply phase-specific reasoning budget when using native mode."""
+        base = self._config.reasoning
+        scheduled = self._reasoning_scheduler.for_phase(base, phase)
+        if scheduled is None or scheduled.mode != "native":
+            return
+        budget = scheduled.budget_tokens or 10000
+        self._agent.generation_config = {
+            "thinking": {"type": "enabled", "budget_tokens": budget},
+        }
+        if self.tracing is not None:
+            self.tracing.record(
+                "reasoning-phase-applied",
+                {"phase": phase, "budget_tokens": budget},
+            )
+
+    async def _maybe_verification_followup(
+        self,
+        response: Any,
+        original_input: Union[str, List[Dict[str, Any]]],
+        session_id: str,
+        context: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Run a forced verification turn before final completion when needed."""
+        if self.verification is None or not isinstance(original_input, str):
+            return response
+
+        should_followup, reason = self.verification.should_followup(session_id, original_input)
+        rg_should_followup = False
+        rg_reason = ""
+        if self.run_guard is not None:
+            rg_should_followup, rg_reason = self.run_guard.should_force_followup(
+                session_id=session_id,
+                user_message=original_input,
+                response=response,
+            )
+        if not should_followup and not rg_should_followup:
+            return response
+
+        if should_followup:
+            self.verification.mark_followup_used(session_id)
+        if self.tracing is not None:
+            self.tracing.record(
+                "verification-followup-required",
+                {
+                    "reason": reason if should_followup else rg_reason,
+                    "session_id": session_id,
+                    "source": "verification" if should_followup else "run_guard",
+                },
+            )
+
+        self._apply_reasoning_phase("verify")
+        if should_followup:
+            followup_prompt = self.verification.build_followup_prompt(reason)
+        else:
+            followup_prompt = self.run_guard.build_followup_prompt(rg_reason) if self.run_guard else ""
+        followup = await self._agent.run(
+            {"message": followup_prompt, **(context or {})},
             session_id=session_id,
-        ):
-            yield event
+        )
+        return followup
 
 
 def create_deep_agent(
@@ -345,7 +912,7 @@ def create_deep_agent(
     if system_prompt is not None:
         agent_config.system_prompt = system_prompt
 
-    if working_dir is not None:
+    if working_dir is not None and not agent_config.sandbox.working_dir:
         agent_config.sandbox.working_dir = working_dir
 
     # Only override if explicitly specified
@@ -383,7 +950,8 @@ def create_deep_agent(
             all_tools.extend(sandbox_fs.get_tools())
         else:
             # Use real filesystem (no sandbox)
-            real_backend = RealFilesystemBackend(base_path=working_dir)
+            fs_base_path = working_dir or agent_config.sandbox.working_dir
+            real_backend = RealFilesystemBackend(base_path=fs_base_path)
             filesystem = FilesystemMiddleware(backend=real_backend)
             middlewares["filesystem"] = filesystem
             all_tools.extend(filesystem.get_tools())
@@ -410,11 +978,16 @@ def create_deep_agent(
             readonly=agent_config.database.readonly,
         )
 
-        # Use mock backend for now (real backend requires connection)
-        # In production, you'd connect to actual database
-        mock_backend = MockDatabaseBackend(readonly=agent_config.database.readonly)
+        # Prefer real database backend; fall back to mock when unavailable.
+        try:
+            db_backend = DatabaseBackend(
+                config=db_config,
+                readonly=agent_config.database.readonly,
+            )
+        except (DatabaseNotAvailableError, Exception):
+            db_backend = MockDatabaseBackend(readonly=agent_config.database.readonly)
         database_mw = DatabaseMiddleware(
-            backend=mock_backend,
+            backend=db_backend,
             readonly=agent_config.database.readonly,
             max_rows=agent_config.database.max_rows,
             timeout=agent_config.database.timeout,
@@ -445,6 +1018,7 @@ def create_deep_agent(
 
     # Memory middleware with composite backend
     filesystem_backend = None
+    memory_startup_context = ""
     if agent_config.memory.enabled:
         # Create composite backend for memory routing
         # Get or create the base filesystem backend
@@ -472,9 +1046,10 @@ def create_deep_agent(
         # Create memory middleware
         memory_mw = MemoryMiddleware(
             memories_path=agent_config.memory.memories_path,
-            agents_md_path=agent_config.memory.agents_md_path,
+            agents_md_path=agent_config.memory.agents_md_path or "/memories/AGENTS.md",
         )
         memory_mw.set_filesystem(filesystem_backend)
+        memory_startup_context = memory_mw.get_startup_context(filesystem_backend)
         middlewares["memory"] = memory_mw
         all_tools.extend(memory_mw.get_tools())
 
@@ -504,6 +1079,71 @@ def create_deep_agent(
         )
         middlewares["context"] = context_mw
         # Context middleware doesn't add tools, but adds system prompt segment
+
+    # Local context onboarding middleware
+    if agent_config.local_context.enabled:
+        local_ctx_mw = LocalContextMiddleware(
+            working_dir=agent_config.sandbox.working_dir or working_dir or str(Path.cwd()),
+            enabled=agent_config.local_context.enabled,
+            max_entries=agent_config.local_context.max_entries,
+            max_depth=agent_config.local_context.max_depth,
+            detect_tools=agent_config.local_context.detect_tools,
+        )
+        middlewares["local_context"] = local_ctx_mw
+
+    # Loop detection middleware
+    if agent_config.loop_detection.enabled:
+        loop_mw = LoopDetectionMiddleware(
+            enabled=agent_config.loop_detection.enabled,
+            file_edit_threshold=agent_config.loop_detection.file_edit_threshold,
+            failure_streak_threshold=agent_config.loop_detection.failure_streak_threshold,
+        )
+        middlewares["loop_detection"] = loop_mw
+
+    # Verification middleware
+    if agent_config.verification.enabled:
+        verification_mw = VerificationMiddleware(
+            enabled=agent_config.verification.enabled,
+            strict=agent_config.verification.strict,
+            max_followups=agent_config.verification.max_followups,
+        )
+        middlewares["verification"] = verification_mw
+
+    # Tracing middleware
+    if agent_config.tracing.enabled:
+        tracing_mw = TracingMiddleware(
+            enabled=agent_config.tracing.enabled,
+            emit_langfuse=agent_config.tracing.emit_langfuse,
+        )
+        middlewares["tracing"] = tracing_mw
+
+    # Time budget middleware
+    if agent_config.time_budget.enabled:
+        time_budget_mw = TimeBudgetMiddleware(
+            enabled=agent_config.time_budget.enabled,
+            soft_limit_seconds=agent_config.time_budget.soft_limit_seconds,
+            hard_limit_seconds=agent_config.time_budget.hard_limit_seconds,
+        )
+        middlewares["time_budget"] = time_budget_mw
+
+    # Run guard middleware
+    if agent_config.run_guard.enabled:
+        run_guard_mw = RunGuardMiddleware(
+            RuntimeRunGuardConfig(
+                enabled=agent_config.run_guard.enabled,
+                max_tool_calls_total=agent_config.run_guard.max_tool_calls_total,
+                max_tool_calls_per_tool=agent_config.run_guard.max_tool_calls_per_tool,
+                max_same_tool_input_repeats=agent_config.run_guard.max_same_tool_input_repeats,
+                max_failure_streak=agent_config.run_guard.max_failure_streak,
+                max_subagent_rounds=agent_config.run_guard.max_subagent_rounds,
+                max_parallel_subagents=agent_config.run_guard.max_parallel_subagents,
+                require_verification_before_done=agent_config.run_guard.require_verification_before_done,
+                verification_tool_names=agent_config.run_guard.verification_tool_names,
+                completion_required_paths=agent_config.run_guard.completion_required_paths,
+                completion_required_patterns=agent_config.run_guard.completion_required_patterns,
+            )
+        )
+        middlewares["run_guard"] = run_guard_mw
 
     # Build system prompt
     prompt_segments = []
@@ -537,6 +1177,9 @@ def create_deep_agent(
         if segment:
             prompt_segments.append(segment)
 
+    if memory_startup_context:
+        prompt_segments.append(memory_startup_context)
+
     combined_prompt = "\n\n".join(prompt_segments) if prompt_segments else None
 
     # Reasoning: inject prompted reasoning prompt if mode is "prompted"
@@ -564,6 +1207,19 @@ def create_deep_agent(
                 raise TypeError(
                     f"Custom tool must be a ToolSpec or callable, got {type(tool).__name__}"
                 )
+
+    # Provide tool inventory to subagents for per-agent allowlist filtering.
+    if "subagents" in middlewares:
+        subagent_tools = [t for t in all_tools if t.name not in {
+            "spawn_subagent",
+            "spawn_parallel",
+            "wait_subagent",
+            "wait_all_subagents",
+            "get_subagent_result",
+            "list_subagents",
+            "cancel_subagent",
+        }]
+        middlewares["subagents"].set_available_tools(subagent_tools)  # type: ignore[attr-defined]
 
     # Wrap filesystem tools with checkpointing (innermost wrapper — records actual changes)
     if checkpoint_manager is not None and "filesystem" in middlewares:
@@ -778,6 +1434,79 @@ def create_deep_agent(
         import time
 
         all_tools = [_wrap_tool_with_hooks(t, hook_engine) for t in all_tools]
+
+    # Wrap tools with middleware observers (tracing/loop-detection/verification)
+    tool_observers = [
+        mw for mw in (
+            middlewares.get("tracing"),
+            middlewares.get("loop_detection"),
+            middlewares.get("verification"),
+            middlewares.get("run_guard"),
+        )
+        if mw is not None
+    ]
+    if tool_observers:
+        import asyncio as _asyncio
+        import time as _time
+
+        def _notify_observers(tool: ToolSpec) -> ToolSpec:
+            original_handler = tool._handler
+
+            async def observed_handler(**kwargs: Any) -> Any:
+                session_id = _active_session_id.get()
+                for obs in tool_observers:
+                    if hasattr(obs, "allow_tool_call"):
+                        allowed, reason = obs.allow_tool_call(session_id, tool.name, kwargs)
+                        if not allowed:
+                            if hasattr(obs, "on_tool_failure"):
+                                obs.on_tool_failure(session_id, tool.name, kwargs)
+                            return {"error": reason}
+                for obs in tool_observers:
+                    if hasattr(obs, "record_tool_start"):
+                        obs.record_tool_start(tool.name, kwargs)
+                    if hasattr(obs, "on_tool_start"):
+                        obs.on_tool_start(session_id, tool.name, kwargs)
+
+                started = _time.time()
+                try:
+                    if _asyncio.iscoroutinefunction(original_handler):
+                        result = await original_handler(**kwargs)
+                    else:
+                        result = original_handler(**kwargs)
+
+                    duration_ms = (_time.time() - started) * 1000
+                    for obs in tool_observers:
+                        if hasattr(obs, "record_tool_success"):
+                            obs.record_tool_success(tool.name, kwargs, duration_ms, result)
+                        if hasattr(obs, "on_tool_success"):
+                            obs.on_tool_success(session_id, tool.name, kwargs)
+                    return result
+                except Exception as e:
+                    duration_ms = (_time.time() - started) * 1000
+                    for obs in tool_observers:
+                        if hasattr(obs, "record_tool_failure"):
+                            obs.record_tool_failure(
+                                tool.name,
+                                kwargs,
+                                str(e),
+                                duration_ms,
+                                error_type=e.__class__.__name__,
+                            )
+                        if hasattr(obs, "on_tool_failure"):
+                            obs.on_tool_failure(session_id, tool.name, kwargs)
+                    raise
+
+            return ToolSpec.from_function(
+                observed_handler,
+                name=tool.name,
+                description=tool.description,
+                input_schema=tool.input_schema,
+                output_schema=tool.output_schema,
+                category=getattr(tool, "category", None),
+                tags=getattr(tool, "tags", None),
+            )
+
+        all_tools = [_notify_observers(t) for t in all_tools]
 
     # Build reasoning-specific Agent constructor args
     agent_kwargs: Dict[str, Any] = {}

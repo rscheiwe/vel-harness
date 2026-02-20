@@ -24,6 +24,7 @@ Example:
         print(event)
 """
 
+import os
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Union
 
@@ -71,6 +72,7 @@ class VelHarness:
         memory: bool = False,
         caching: bool = False,
         retry: bool = False,
+        web_search: Optional[bool] = None,
         hooks: Optional[Dict[str, List[HookMatcher]]] = None,
         reasoning: Optional[Union[str, Dict[str, Any], ReasoningConfig]] = None,
         fallback_model: Optional[Union[str, Dict[str, Any]]] = None,
@@ -107,6 +109,8 @@ class VelHarness:
             memory: Enable memory middleware
             caching: Enable tool/prompt caching middleware
             retry: Enable tool retry with backoff middleware
+            web_search: Enable built-in Tavily web_search tool. If None (default),
+                   auto-enables when TAVILY_API_KEY is set.
             hooks: Control hooks for tool execution. Dict mapping event names
                    to lists of HookMatchers. Supported events:
                    - "pre_tool_use": Can block/modify tool calls
@@ -125,6 +129,12 @@ class VelHarness:
         """
         self._model = model
         self._custom_tools = tools or []
+        if web_search is None:
+            web_search = bool(os.environ.get("TAVILY_API_KEY"))
+        if web_search:
+            from vel_harness.tools.web_search import create_web_search_tool
+
+            self._custom_tools.append(create_web_search_tool())
         self._skill_dirs = [
             str(d) if isinstance(d, Path) else d
             for d in (skill_dirs or [])
@@ -132,7 +142,9 @@ class VelHarness:
         self._custom_agents = custom_agents or {}
         self._system_prompt = system_prompt
         self._max_turns = max_turns
-        self._working_directory = str(working_directory) if working_directory else None
+        self._working_directory = (
+            str(working_directory) if working_directory else str(Path.cwd())
+        )
 
         # Create approval manager for parallel tool approvals
         self._approval_manager = ApprovalManager()
@@ -261,6 +273,47 @@ class VelHarness:
             },
             "caching": {"enabled": caching},
             "retry": {"enabled": retry},
+            "local_context": {"enabled": True},
+            "loop_detection": {"enabled": True},
+            "verification": {"enabled": True, "strict": True, "max_followups": 2},
+            "tracing": {"enabled": True, "emit_langfuse": bool(os.environ.get("LANGFUSE_PUBLIC_KEY"))},
+            "reasoning_scheduler": {
+                "enabled": True,
+                "planning_budget_tokens": 12000,
+                "build_budget_tokens": 5000,
+                "verify_budget_tokens": 15000,
+            },
+            "time_budget": {
+                "enabled": True,
+                "soft_limit_seconds": 240,
+                "hard_limit_seconds": 300,
+            },
+            "run_guard": {
+                "enabled": True,
+                "max_tool_calls_total": 60,
+                "max_tool_calls_per_tool": {
+                    "read_file": 30,
+                    "grep": 20,
+                    "glob": 20,
+                    "write_file": 20,
+                    "edit_file": 30,
+                    "spawn_subagent": 10,
+                    "spawn_parallel": 6,
+                    "run_subagent_workflow": 4,
+                },
+                "max_same_tool_input_repeats": 4,
+                "max_failure_streak": 6,
+                "max_subagent_rounds": 8,
+                "max_parallel_subagents": 5,
+                "require_verification_before_done": True,
+                "verification_tool_names": [
+                    "execute",
+                    "execute_python",
+                    "sql_query",
+                    "wait_subagent",
+                    "wait_all_subagents",
+                ],
+            },
         }
 
         if self._system_prompt:
@@ -279,11 +332,8 @@ class VelHarness:
 
     def _create_agent(self) -> DeepAgent:
         """Create the underlying DeepAgent with tool_result skill injection."""
-        # Only pass working_dir to factory if the sandbox config doesn't already
-        # have one — the factory's working_dir param overrides config.sandbox.working_dir
-        factory_working_dir = self._working_directory
-        if self._config.sandbox.working_dir:
-            factory_working_dir = None  # Let config.sandbox.working_dir take effect
+        # Always provide a scoped filesystem base path to the factory.
+        factory_working_dir = self._working_directory or self._config.sandbox.working_dir
 
         # Create checkpoint manager for filesystem change tracking
         self._checkpoint_manager = FileCheckpointManager()
@@ -485,6 +535,23 @@ class VelHarness:
                     print(event)
         """
         return HarnessSession(harness=self, session_id=session_id)
+
+    async def run_role_workflow(
+        self,
+        goal: str,
+        session_id: Optional[str] = None,
+        include_critic: bool = True,
+    ) -> Dict[str, Any]:
+        """Run discover->implement->verify->critic workflow via subagents middleware."""
+        if self._deep_agent.subagents is None:
+            return {"error": "Subagents middleware is not enabled"}
+        sid = session_id or "default"
+        result = await self._deep_agent.subagents.run_workflow(
+            goal=goal,
+            include_critic=include_critic,
+        )
+        result["session_id"] = sid
+        return result
 
 
 # Convenience factory functions

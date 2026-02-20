@@ -120,18 +120,21 @@ class TestReasoningConfigFromValue:
 
     def test_from_dict_with_delimiters(self):
         """Test from_value with dict including delimiters."""
-        config = ReasoningConfig.from_value({
+        payload = {
             "mode": "prompted",
             "delimiters": {
                 "format": "json",
                 "thinking_key": "reason",
                 "answer_key": "response",
             },
-        })
+        }
+        config = ReasoningConfig.from_value(payload)
         assert config.mode == "prompted"
         assert config.delimiters.format == "json"
         assert config.delimiters.thinking_key == "reason"
         assert config.delimiters.answer_key == "response"
+        # Ensure input dict is not mutated.
+        assert "delimiters" in payload
 
     def test_from_reasoning_config_passthrough(self):
         """Test from_value passes through ReasoningConfig instance."""

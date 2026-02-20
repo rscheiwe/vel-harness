@@ -137,6 +137,14 @@ class HarnessSession:
             return str(last_event)
         return ""
 
+    async def run_role_workflow(self, goal: str, include_critic: bool = True) -> Dict[str, Any]:
+        """Run discover->implement->verify->critic workflow in this session."""
+        return await self._harness.run_role_workflow(
+            goal=goal,
+            session_id=self._session_id,
+            include_critic=include_critic,
+        )
+
     def set_model(self, model: Union[str, Dict[str, Any]]) -> None:
         """Switch model for subsequent queries.
 

@@ -292,8 +292,8 @@ class ToolRetryMiddleware:
         middleware = self
         original_handler = tool._handler
 
-        def retry_handler(**kwargs: Any) -> Any:
-            result = middleware.execute_with_retry(
+        async def retry_handler(**kwargs: Any) -> Any:
+            result = await middleware.execute_with_retry_async(
                 original_handler, tool.name, kwargs
             )
 
@@ -446,7 +446,7 @@ class CircuitBreakerMiddleware:
         middleware = self
         original_handler = tool._handler
 
-        def circuit_handler(**kwargs: Any) -> Any:
+        async def circuit_handler(**kwargs: Any) -> Any:
             circuit = middleware._get_circuit(tool.name)
 
             if circuit.is_open:
@@ -456,7 +456,10 @@ class CircuitBreakerMiddleware:
                 )
 
             try:
-                result = original_handler(**kwargs)
+                if asyncio.iscoroutinefunction(original_handler):
+                    result = await original_handler(**kwargs)
+                else:
+                    result = original_handler(**kwargs)
                 circuit.record_success()
                 return result
             except Exception as e:

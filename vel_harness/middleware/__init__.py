@@ -54,6 +54,26 @@ from vel_harness.middleware.retry import (
     CircuitBreakerMiddleware,
     create_retry_middleware,
 )
+from vel_harness.middleware.local_context import (
+    LocalContextMiddleware,
+)
+from vel_harness.middleware.loop_detection import (
+    LoopDetectionMiddleware,
+)
+from vel_harness.middleware.verification import (
+    VerificationMiddleware,
+)
+from vel_harness.middleware.tracing import (
+    TracingMiddleware,
+    TraceEvent,
+)
+from vel_harness.middleware.time_budget import (
+    TimeBudgetMiddleware,
+)
+from vel_harness.middleware.run_guard import (
+    RunGuardMiddleware,
+    RunGuardConfig,
+)
 
 __all__ = [
     "PlanningMiddleware",
@@ -89,4 +109,13 @@ __all__ = [
     "CircuitBreaker",
     "CircuitBreakerMiddleware",
     "create_retry_middleware",
+    # New harness-strengthening middlewares
+    "LocalContextMiddleware",
+    "LoopDetectionMiddleware",
+    "VerificationMiddleware",
+    "TracingMiddleware",
+    "TraceEvent",
+    "TimeBudgetMiddleware",
+    "RunGuardMiddleware",
+    "RunGuardConfig",
 ]

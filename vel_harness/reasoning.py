@@ -130,7 +130,8 @@ class ReasoningConfig:
         if isinstance(value, str):
             return cls(mode=value)  # type: ignore[arg-type]
         if isinstance(value, dict):
-            delimiters_data = value.pop("delimiters", None)
+            data = dict(value)
+            delimiters_data = data.pop("delimiters", None)
             delimiters = ReasoningDelimiters()
             if isinstance(delimiters_data, dict):
                 delimiters = ReasoningDelimiters(
@@ -140,7 +141,7 @@ class ReasoningConfig:
                     thinking_key=delimiters_data.get("thinking_key", "thinking"),
                     answer_key=delimiters_data.get("answer_key", "answer"),
                 )
-            return cls(delimiters=delimiters, **value)
+            return cls(delimiters=delimiters, **data)
         return cls()
 
 

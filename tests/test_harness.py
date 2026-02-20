@@ -205,3 +205,39 @@ class TestDeprecationWarnings:
                     and "DeepAgent" in str(x.message)
                 ]
                 assert len(deprecation_warnings) == 0
+
+
+class TestRoleWorkflow:
+    """Tests for one-call subagent role workflow helper."""
+
+    @pytest.mark.asyncio
+    async def test_run_role_workflow_success(self):
+        """Harness should delegate role workflow to subagents middleware."""
+        with patch("vel_harness.factory.Agent"):
+            harness = VelHarness(model={"provider": "anthropic", "model": "test"})
+
+        subagents = MagicMock()
+        subagents.run_workflow = AsyncMock(
+            return_value={"status": "completed"}
+        )
+        harness._deep_agent._middlewares["subagents"] = subagents
+
+        out = await harness.run_role_workflow("Ship feature", include_critic=False)
+
+        assert out["status"] == "completed"
+        assert out["session_id"] == "default"
+        subagents.run_workflow.assert_called_once_with(
+            goal="Ship feature",
+            include_critic=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_role_workflow_without_subagents(self):
+        """Harness should return clear error if subagents middleware is unavailable."""
+        with patch("vel_harness.factory.Agent"):
+            harness = VelHarness(model={"provider": "anthropic", "model": "test"})
+        harness._deep_agent._middlewares.pop("subagents", None)
+
+        out = await harness.run_role_workflow("Ship feature")
+
+        assert "error" in out

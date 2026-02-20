@@ -422,7 +422,7 @@ class TestRunStream:
 
     @pytest.mark.asyncio
     async def test_partial_events_before_error(self):
-        """Events before a retryable error are yielded, then fallback runs."""
+        """Partial primary events are discarded on retryable error; fallback output is used."""
         agent = make_deep_agent()
         call_count = 0
 
@@ -449,10 +449,9 @@ class TestRunStream:
         async for event in wrapper.run_stream(input_text="test"):
             collected.append(event)
 
-        # Partial events from primary + full response from fallback
-        assert len(collected) == 2
-        assert collected[0]["delta"] == "partial "
-        assert collected[1]["delta"] == "full response"
+        # Only fallback response should be emitted
+        assert len(collected) == 1
+        assert collected[0]["delta"] == "full response"
 
     @pytest.mark.asyncio
     async def test_non_dict_events_pass_through(self):

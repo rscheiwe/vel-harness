@@ -6,6 +6,7 @@ Implements caching for improved performance:
 - Tool response caching for repeated calls
 """
 
+import asyncio
 import hashlib
 import json
 import time
@@ -332,14 +333,17 @@ class ToolCachingMiddleware:
         middleware = self
         original_handler = tool._handler
 
-        def cached_handler(**kwargs: Any) -> Any:
+        async def cached_handler(**kwargs: Any) -> Any:
             # Check cache
             hit, cached_result = middleware.get_cached(tool.name, kwargs)
             if hit:
                 return cached_result
 
             # Execute and cache
-            result = original_handler(**kwargs)
+            if asyncio.iscoroutinefunction(original_handler):
+                result = await original_handler(**kwargs)
+            else:
+                result = original_handler(**kwargs)
             middleware.cache_result(tool.name, kwargs, result)
             return result
 

@@ -70,6 +70,12 @@ def _get_tiktoken():
                 "tiktoken not installed - using heuristic token counting. "
                 "Install with: pip install tiktoken"
             )
+        except Exception as e:
+            _tiktoken_available = False
+            logger.debug(
+                "tiktoken unavailable (%s) - using heuristic token counting",
+                e,
+            )
     return _tiktoken_encoder if _tiktoken_available else None
 
 

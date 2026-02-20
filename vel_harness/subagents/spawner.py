@@ -141,6 +141,19 @@ class SubagentSpawner:
         """Generate a unique subagent ID."""
         return f"subagent_{uuid.uuid4().hex[:8]}"
 
+    def _resolve_tools(
+        self,
+        allowed_tool_names: Optional[List[str]],
+        default_tools: Optional[List[Any]],
+    ) -> List[Any]:
+        """Resolve tool instances for a subagent, optionally filtered by name."""
+        tools = list(default_tools or [])
+        if not allowed_tool_names:
+            return tools
+
+        allowed = set(allowed_tool_names)
+        return [t for t in tools if getattr(t, "name", None) in allowed]
+
     async def _run_subagent(
         self,
         subagent_id: str,
@@ -171,15 +184,17 @@ class SubagentSpawner:
             try:
                 # Create agent instance
                 agent = Agent(
+                    id=subagent_id,
                     model=config.model or self._default_config.model,
                     system_prompt=config.system_prompt or self._default_config.system_prompt,
                     tools=config.tools or self._default_config.tools or [],
+                    policies={"max_steps": config.max_turns},
                 )
 
                 # Run the agent with timeout
                 try:
                     response = await asyncio.wait_for(
-                        agent.run(task, max_turns=config.max_turns),
+                        agent.run({"message": task}),
                         timeout=config.timeout,
                     )
 
@@ -230,7 +245,7 @@ class SubagentSpawner:
             effective_config = SubagentConfig(
                 model=agent_config.model,
                 system_prompt=agent_config.system_prompt,
-                tools=self._default_config.tools,  # Tools resolved by middleware
+                tools=self._resolve_tools(agent_config.tools, self._default_config.tools),
                 max_turns=agent_config.max_turns,
                 timeout=agent_config.timeout,
             )
@@ -243,7 +258,7 @@ class SubagentSpawner:
                 effective_config = SubagentConfig(
                     model=agent_config.model or self._default_config.model,
                     system_prompt=agent_config.system_prompt or self._default_config.system_prompt,
-                    tools=self._default_config.tools,
+                    tools=self._resolve_tools(agent_config.tools, self._default_config.tools),
                     max_turns=agent_config.max_turns,
                     timeout=agent_config.timeout,
                 )

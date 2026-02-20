@@ -174,7 +174,8 @@ class TestToolRetryMiddleware:
         assert not result.success
         assert isinstance(result.result, RuntimeError)
 
-    def test_wrap_tool(self, middleware):
+    @pytest.mark.asyncio
+    async def test_wrap_tool(self, middleware):
         """Test wrapping a tool with retry logic."""
         call_count = 0
 
@@ -192,12 +193,13 @@ class TestToolRetryMiddleware:
         )
 
         wrapped = middleware.wrap_tool(tool)
-        result = wrapped._handler()
+        result = await wrapped._handler()
 
         assert result == "success"
         assert call_count == 2
 
-    def test_wrap_tool_failure_raises(self, middleware):
+    @pytest.mark.asyncio
+    async def test_wrap_tool_failure_raises(self, middleware):
         """Test wrapped tool raises on final failure."""
         def handler():
             raise RuntimeError("always fails")
@@ -211,7 +213,7 @@ class TestToolRetryMiddleware:
         wrapped = middleware.wrap_tool(tool)
 
         with pytest.raises(RuntimeError, match="always fails"):
-            wrapped._handler()
+            await wrapped._handler()
 
 
 class TestToolRetryMiddlewareAsync:
@@ -321,7 +323,8 @@ class TestCircuitBreakerMiddleware:
             reset_timeout=0.1,
         )
 
-    def test_wrap_tool_success(self, middleware):
+    @pytest.mark.asyncio
+    async def test_wrap_tool_success(self, middleware):
         """Test wrapped tool works on success."""
         def handler():
             return "success"
@@ -333,11 +336,12 @@ class TestCircuitBreakerMiddleware:
         )
 
         wrapped = middleware.wrap_tool(tool)
-        result = wrapped._handler()
+        result = await wrapped._handler()
 
         assert result == "success"
 
-    def test_wrap_tool_opens_on_failures(self, middleware):
+    @pytest.mark.asyncio
+    async def test_wrap_tool_opens_on_failures(self, middleware):
         """Test wrapped tool opens circuit on failures."""
         def handler():
             raise RuntimeError("error")
@@ -352,15 +356,15 @@ class TestCircuitBreakerMiddleware:
 
         # First failure
         with pytest.raises(RuntimeError):
-            wrapped._handler()
+            await wrapped._handler()
 
         # Second failure - opens circuit
         with pytest.raises(RuntimeError):
-            wrapped._handler()
+            await wrapped._handler()
 
         # Third call - circuit open
         with pytest.raises(RuntimeError, match="Circuit breaker open"):
-            wrapped._handler()
+            await wrapped._handler()
 
     def test_get_stats(self, middleware):
         """Test getting circuit statistics."""
@@ -400,7 +404,8 @@ class TestCreateRetryMiddleware:
 class TestRetryIntegration:
     """Integration tests for retry middleware."""
 
-    def test_full_workflow(self):
+    @pytest.mark.asyncio
+    async def test_full_workflow(self):
         """Test full retry workflow."""
         middleware = create_retry_middleware(
             max_retries=3,
@@ -423,12 +428,13 @@ class TestRetryIntegration:
         )
 
         wrapped = middleware.wrap_tool(tool)
-        result = wrapped._handler(value=5)
+        result = await wrapped._handler(value=5)
 
         assert result == 10
         assert attempt_count == 3
 
-    def test_retry_with_circuit_breaker(self):
+    @pytest.mark.asyncio
+    async def test_retry_with_circuit_breaker(self):
         """Test retry and circuit breaker together."""
         retry_mw, circuit_mw = create_retry_middleware(
             max_retries=1,
@@ -451,12 +457,12 @@ class TestRetryIntegration:
 
         # First call fails (with retries)
         with pytest.raises(RuntimeError):
-            wrapped._handler()
+            await wrapped._handler()
 
         # Second call fails and opens circuit
         with pytest.raises(RuntimeError):
-            wrapped._handler()
+            await wrapped._handler()
 
         # Third call blocked by circuit
         with pytest.raises(RuntimeError, match="Circuit breaker open"):
-            wrapped._handler()
+            await wrapped._handler()

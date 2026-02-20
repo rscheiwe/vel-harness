@@ -5,11 +5,15 @@ Tests for subagent spawner and middleware.
 Note: These tests use mocks since actual subagent execution requires a full agent setup.
 """
 
+import asyncio
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from vel import ToolSpec
+
+from vel_harness.agents.registry import AgentRegistry
 from vel_harness.subagents.spawner import (
     SubagentConfig,
     SubagentResult,
@@ -137,6 +141,29 @@ class TestSubagentSpawner:
             assert subagent_id.startswith("subagent_")
             assert spawner.active_count == 1 or subagent_id in spawner._results
 
+    @pytest.mark.asyncio
+    async def test_spawn_applies_registry_tool_allowlist(self) -> None:
+        """spawn() should pass agent-allowed tools into subagent config."""
+        spawner = SubagentSpawner(agent_registry=AgentRegistry())
+
+        read_tool = ToolSpec.from_function(lambda: "ok", name="read_file")
+        write_tool = ToolSpec.from_function(lambda: "ok", name="write_file")
+        spawner._default_config.tools = [read_tool, write_tool]
+
+        with patch.object(spawner, "_run_subagent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = SubagentResult(
+                id="test",
+                task="Test",
+                status=SubagentStatus.COMPLETED,
+                result="Done",
+            )
+            subagent_id = await spawner.spawn("inspect", agent="explore")
+            await asyncio.sleep(0)
+            assert subagent_id.startswith("subagent_")
+            assert mock_run.called
+            cfg = mock_run.call_args[0][2]
+            assert [t.name for t in cfg.tools] == ["read_file"]
+
     def test_get_status_unknown(self) -> None:
         """Test getting status of unknown subagent."""
         spawner = SubagentSpawner()
@@ -175,6 +202,36 @@ class TestSubagentSpawner:
         result = spawner.cancel("unknown_id")
         assert result is False
 
+    def test_resolve_tools_applies_allowlist(self) -> None:
+        """Only allowed tool names should be passed to subagent."""
+        t1 = ToolSpec.from_function(lambda: "ok", name="read_file")
+        t2 = ToolSpec.from_function(lambda: "ok", name="write_file")
+        spawner = SubagentSpawner(default_config=SubagentConfig(tools=[t1, t2]))
+        filtered = spawner._resolve_tools(["read_file"], [t1, t2])
+        assert [t.name for t in filtered] == ["read_file"]
+
+    @pytest.mark.asyncio
+    async def test_run_subagent_uses_vel_input_contract(self) -> None:
+        """Subagent should call Agent.run with {'message': task}."""
+        spawner = SubagentSpawner()
+
+        with patch("vel_harness.subagents.spawner.Agent") as MockAgent:
+            agent_instance = MagicMock()
+            agent_instance.run = AsyncMock(return_value=MagicMock(content="ok", messages=[]))
+            MockAgent.return_value = agent_instance
+
+            result = await spawner._run_subagent(
+                "subagent_123",
+                "do the task",
+                SubagentConfig(model={"provider": "anthropic", "model": "x"}, timeout=1.0),
+            )
+
+            assert result.status == SubagentStatus.COMPLETED
+            agent_instance.run.assert_called_once()
+            args, kwargs = agent_instance.run.call_args
+            assert args[0] == {"message": "do the task"}
+            assert "max_turns" not in kwargs
+
 
 # SubagentsMiddleware Tests
 
@@ -207,6 +264,7 @@ class TestSubagentsMiddleware:
         assert "get_subagent_result" in tool_names
         assert "list_subagents" in tool_names
         assert "cancel_subagent" in tool_names
+        assert "run_subagent_workflow" in tool_names
 
     def test_tool_categories(self) -> None:
         """Test that tools have correct categories."""
@@ -324,6 +382,30 @@ class TestSubagentsMiddleware:
             result = await middleware._wait_all()
 
             assert result["count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_run_workflow(self) -> None:
+        """Test discover->implement->verify->critic workflow execution."""
+        middleware = SubagentsMiddleware()
+
+        with patch.object(middleware._spawner, "spawn", new_callable=AsyncMock) as mock_spawn, patch.object(
+            middleware._spawner, "wait", new_callable=AsyncMock
+        ) as mock_wait:
+            mock_spawn.side_effect = ["d1", "i1", "v1", "c1"]
+            mock_wait.side_effect = [
+                SubagentResult(id="d1", task="d", status=SubagentStatus.COMPLETED, result="discover"),
+                SubagentResult(id="i1", task="i", status=SubagentStatus.COMPLETED, result="implement"),
+                SubagentResult(id="v1", task="v", status=SubagentStatus.COMPLETED, result="verify"),
+                SubagentResult(id="c1", task="c", status=SubagentStatus.COMPLETED, result="critic"),
+            ]
+
+            out = await middleware.run_workflow("Ship feature", include_critic=True)
+
+            assert out["status"] == "completed"
+            assert out["stages"]["discover"]["result"] == "discover"
+            assert out["stages"]["implement"]["result"] == "implement"
+            assert out["stages"]["verify"]["result"] == "verify"
+            assert out["stages"]["critic"]["result"] == "critic"
 
     def test_get_result_not_found(self) -> None:
         """Test getting result for unknown subagent."""

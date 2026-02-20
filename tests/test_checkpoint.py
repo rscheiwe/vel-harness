@@ -279,7 +279,7 @@ class TestRewind:
         assert backend.files["/c.py"] == "c_orig"
 
     def test_rewind_lifo_order(self):
-        """Rewind processes changes in LIFO order (most recent first)."""
+        """Rewind restores path to checkpoint baseline across multiple edits."""
         mgr = FileCheckpointManager()
         backend = MockBackend()
 
@@ -289,13 +289,9 @@ class TestRewind:
         mgr.record_change("/test.py", "edit", previous_content="written", new_content="edited")
 
         reverted = mgr.rewind_to(cp_id, backend)
-        # LIFO: edit reverted first (restores "written"), then write skipped (already seen)
-        # Only one revert per path
+        # Only one restore per path, but content should be checkpoint baseline.
         assert len(reverted) == 1
-        # The most recent change is reverted: edit's previous_content = "written"
-        # But since write's previous_content = "original" is the true original,
-        # LIFO with dedup means the edit is reverted first
-        assert backend.files["/test.py"] == "written"
+        assert backend.files["/test.py"] == "original"
 
     def test_rewind_removes_checkpoints(self):
         """Rewind removes checkpoints from the rewind point onwards."""

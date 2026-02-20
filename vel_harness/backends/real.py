@@ -30,13 +30,22 @@ class RealFilesystemBackend:
 
     def _resolve_path(self, path: str) -> Path:
         """Resolve a path, optionally relative to base_path."""
-        if self.base_path and not path.startswith("/"):
-            return (self.base_path / path).resolve()
+        if self.base_path:
+            # Enforce all operations under base_path, even for absolute inputs.
+            candidate = (self.base_path / path.lstrip("/")).resolve()
+            try:
+                candidate.relative_to(self.base_path)
+            except ValueError:
+                raise PermissionError(f"Path escapes base_path: {path}")
+            return candidate
         return Path(path).resolve()
 
     def ls(self, path: str = "/") -> Dict[str, Any]:
         """List files and directories at a path."""
-        resolved = self._resolve_path(path)
+        try:
+            resolved = self._resolve_path(path)
+        except PermissionError as e:
+            return {"path": path, "error": str(e), "entries": []}
 
         if not resolved.exists():
             return {
@@ -87,7 +96,10 @@ class RealFilesystemBackend:
         limit: int = 100,
     ) -> Dict[str, Any]:
         """Read file contents with pagination."""
-        resolved = self._resolve_path(path)
+        try:
+            resolved = self._resolve_path(path)
+        except PermissionError as e:
+            return {"path": path, "error": str(e), "content": ""}
 
         if not resolved.exists():
             return {
@@ -137,7 +149,10 @@ class RealFilesystemBackend:
 
     def write_file(self, path: str, content: str) -> Dict[str, Any]:
         """Write content to a file."""
-        resolved = self._resolve_path(path)
+        try:
+            resolved = self._resolve_path(path)
+        except PermissionError as e:
+            return {"status": "error", "path": path, "error": str(e)}
 
         try:
             # Create parent directories if needed
@@ -174,7 +189,10 @@ class RealFilesystemBackend:
         new_text: str,
     ) -> Dict[str, Any]:
         """Edit file by replacing old_text with new_text."""
-        resolved = self._resolve_path(path)
+        try:
+            resolved = self._resolve_path(path)
+        except PermissionError as e:
+            return {"status": "error", "path": path, "error": str(e)}
 
         if not resolved.exists():
             return {
@@ -232,12 +250,12 @@ class RealFilesystemBackend:
     def glob(self, pattern: str) -> Dict[str, Any]:
         """Find files matching a glob pattern."""
         # Determine base directory for glob
-        if pattern.startswith("/"):
+        if self.base_path:
+            base = self.base_path
+            glob_pattern = pattern.lstrip("/")
+        elif pattern.startswith("/"):
             base = Path("/")
             glob_pattern = pattern[1:]
-        elif self.base_path:
-            base = self.base_path
-            glob_pattern = pattern
         else:
             base = Path.cwd()
             glob_pattern = pattern
@@ -272,7 +290,10 @@ class RealFilesystemBackend:
         head_limit: int = 50,
     ) -> Dict[str, Any]:
         """Search for a regex pattern in files."""
-        resolved = self._resolve_path(path)
+        try:
+            resolved = self._resolve_path(path)
+        except PermissionError as e:
+            return {"pattern": pattern, "path": path, "error": str(e), "matches": []}
 
         if not resolved.exists():
             return {

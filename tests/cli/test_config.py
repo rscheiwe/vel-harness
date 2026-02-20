@@ -61,8 +61,10 @@ class TestApprovalSettings:
         """Test default auto-approve list."""
         settings = ApprovalSettings()
         assert settings.require_approval is True
-        assert "read_file" in settings.auto_approve
-        assert "ls" in settings.auto_approve
+        assert "glob" in settings.auto_approve
+        assert "grep" in settings.auto_approve
+        assert "read_file" not in settings.auto_approve
+        assert "ls" not in settings.auto_approve
         assert len(settings.always_deny) == 0
 
     def test_custom_approval_settings(self):

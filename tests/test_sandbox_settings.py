@@ -34,6 +34,7 @@ class TestSandboxConfigExpanded:
         """Test default values for new fields."""
         config = SandboxConfig()
         assert config.enabled is True
+        assert config.fallback_unsandboxed is True
         assert config.auto_allow_execute_if_sandboxed is True
         assert config.excluded_commands == []
         assert config.allowed_commands == []

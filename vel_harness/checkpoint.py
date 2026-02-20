@@ -203,35 +203,35 @@ class FileCheckpointManager:
         for cp in self._checkpoints[cp_index:]:
             changes_to_revert.extend(cp.changes_since)
 
-        # Revert in reverse order (LIFO)
+        # Restore each changed file to its baseline at checkpoint creation.
+        # For a given path, the first change after checkpoint contains the
+        # baseline in previous_content.
+        baseline_by_path: Dict[str, Optional[str]] = {}
+        for change in changes_to_revert:
+            if change.path not in baseline_by_path:
+                baseline_by_path[change.path] = change.previous_content
+
         reverted_paths: List[str] = []
-        reverted_set: set = set()
-
-        for change in reversed(changes_to_revert):
-            # Only revert each path once (most recent change first)
-            if change.path in reverted_set:
-                continue
-
-            if change.previous_content is not None:
-                # Restore the previous content
-                backend.write_file(change.path, change.previous_content)
+        for path, baseline_content in baseline_by_path.items():
+            if baseline_content is not None:
+                backend.write_file(path, baseline_content)
             else:
-                # File was new (no previous content) — write empty to "delete"
-                # We write empty string since the protocol doesn't define delete
-                backend.write_file(change.path, "")
-
-            reverted_paths.append(change.path)
-            reverted_set.add(change.path)
+                # File did not exist at checkpoint.
+                if hasattr(backend, "delete_file"):
+                    try:
+                        backend.delete_file(path)  # type: ignore[attr-defined]
+                    except Exception:
+                        backend.write_file(path, "")
+                else:
+                    backend.write_file(path, "")
+            reverted_paths.append(path)
 
         # Remove checkpoints from the rewind point onwards
         self._checkpoints = self._checkpoints[:cp_index]
 
-        # Remove changes that were reverted from _all_changes
-        # Keep only changes that came before the checkpoint
-        cutoff_time = changes_to_revert[0].timestamp if changes_to_revert else time.time()
-        self._all_changes = [
-            c for c in self._all_changes if c.timestamp < cutoff_time
-        ]
+        # Remove reverted changes from _all_changes.
+        reverted_ids = {id(c) for c in changes_to_revert}
+        self._all_changes = [c for c in self._all_changes if id(c) not in reverted_ids]
 
         return reverted_paths
 

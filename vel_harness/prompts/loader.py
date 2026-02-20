@@ -82,6 +82,10 @@ class PromptLoader:
     PIEBALD_AGENT_MAP = {
         "explore": "agent-prompt-explore",
         "plan": "agent-prompt-plan-mode-enhanced",
+        "discover": "agent-prompt-explore",
+        "implement": "agent-prompt-task-tool",
+        "verify": "agent-prompt-task-tool",
+        "critic": "agent-prompt-task-tool",
         "task": "agent-prompt-task-tool",
         "default": "agent-prompt-task-tool",
     }

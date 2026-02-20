@@ -111,8 +111,9 @@ class FallbackStreamWrapper:
         Yields:
             Stream events from the agent
         """
-        # Try primary model
+        # Try primary model (buffer events so we can discard on retryable failure)
         error_event = None
+        buffered_events: List[Any] = []
         async for event in self._agent.run_stream(
             input_text=input_text,
             session_id=session_id,
@@ -124,17 +125,20 @@ class FallbackStreamWrapper:
 
                 if self.is_retryable_status(status_code) or self.is_retryable_error(error_str):
                     error_event = event
-                    # Don't yield the error — we'll retry with fallback
                     break
                 else:
-                    # Non-retryable error — pass through
+                    # Non-retryable error — flush buffer and pass through.
+                    for buffered in buffered_events:
+                        yield buffered
                     yield event
                     return
             else:
-                yield event
+                buffered_events.append(event)
 
-        # If no retryable error, we're done
+        # If no retryable error, flush primary buffer and exit.
         if error_event is None:
+            for buffered in buffered_events:
+                yield buffered
             return
 
         # Retry with fallback model
@@ -152,6 +156,7 @@ class FallbackStreamWrapper:
 
             try:
                 fallback_error = None
+                fallback_buffer: List[Any] = []
                 async for event in self._agent.run_stream(
                     input_text=input_text,
                     session_id=session_id,
@@ -165,13 +170,17 @@ class FallbackStreamWrapper:
                             fallback_error = event
                             break
                         else:
+                            for buffered in fallback_buffer:
+                                yield buffered
                             yield event
                             return
                     else:
-                        yield event
+                        fallback_buffer.append(event)
 
                 if fallback_error is None:
-                    # Fallback succeeded
+                    # Fallback succeeded - emit buffered fallback stream.
+                    for buffered in fallback_buffer:
+                        yield buffered
                     return
 
                 # Fallback also got retryable error — continue to next attempt

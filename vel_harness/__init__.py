@@ -65,6 +65,13 @@ from vel_harness.config import (
     FilesystemConfig,
     CachingConfig,
     RetryConfig,
+    LocalContextConfig,
+    LoopDetectionConfig,
+    VerificationConfig,
+    TracingConfig,
+    ReasoningSchedulerConfig,
+    TimeBudgetConfig,
+    RunGuardConfig,
 )
 
 # Hooks
@@ -122,6 +129,25 @@ from vel_harness.middleware.skills import (
 )
 from vel_harness.middleware.subagents import (
     SubagentsMiddleware,
+)
+from vel_harness.middleware.local_context import (
+    LocalContextMiddleware,
+)
+from vel_harness.middleware.loop_detection import (
+    LoopDetectionMiddleware,
+)
+from vel_harness.middleware.verification import (
+    VerificationMiddleware,
+)
+from vel_harness.middleware.tracing import (
+    TracingMiddleware,
+    TraceEvent,
+)
+from vel_harness.middleware.time_budget import (
+    TimeBudgetMiddleware,
+)
+from vel_harness.middleware.run_guard import (
+    RunGuardMiddleware,
 )
 
 # Backends
@@ -192,6 +218,13 @@ __all__ = [
     "FilesystemConfig",
     "CachingConfig",
     "RetryConfig",
+    "LocalContextConfig",
+    "LoopDetectionConfig",
+    "VerificationConfig",
+    "TracingConfig",
+    "ReasoningSchedulerConfig",
+    "TimeBudgetConfig",
+    "RunGuardConfig",
     # Reasoning
     "ReasoningConfig",
     "ReasoningDelimiters",
@@ -212,6 +245,13 @@ __all__ = [
     "DatabaseMiddleware",
     "SkillsMiddleware",
     "SubagentsMiddleware",
+    "LocalContextMiddleware",
+    "LoopDetectionMiddleware",
+    "VerificationMiddleware",
+    "TracingMiddleware",
+    "TraceEvent",
+    "TimeBudgetMiddleware",
+    "RunGuardMiddleware",
     # Backends
     "StateFilesystemBackend",
     "FilesystemBackend",

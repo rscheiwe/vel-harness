@@ -157,6 +157,105 @@ class RetryConfig:
 
 
 @dataclass
+class LocalContextConfig:
+    """Local environment context onboarding configuration."""
+
+    enabled: bool = True
+    max_entries: int = 40
+    max_depth: int = 1
+    detect_tools: List[str] = field(default_factory=lambda: [
+        "python",
+        "python3",
+        "pytest",
+        "uv",
+        "npm",
+        "pnpm",
+        "node",
+        "go",
+        "cargo",
+        "ruff",
+        "mypy",
+    ])
+
+
+@dataclass
+class LoopDetectionConfig:
+    """Loop detection configuration."""
+
+    enabled: bool = True
+    file_edit_threshold: int = 4
+    failure_streak_threshold: int = 3
+
+
+@dataclass
+class VerificationConfig:
+    """Pre-completion verification configuration."""
+
+    enabled: bool = True
+    strict: bool = True
+    max_followups: int = 2
+
+
+@dataclass
+class TracingConfig:
+    """Structured tracing configuration."""
+
+    enabled: bool = True
+    emit_langfuse: bool = False
+
+
+@dataclass
+class ReasoningSchedulerConfig:
+    """Phase-aware reasoning scheduler configuration."""
+
+    enabled: bool = True
+    planning_budget_tokens: int = 12_000
+    build_budget_tokens: int = 5_000
+    verify_budget_tokens: int = 15_000
+
+
+@dataclass
+class TimeBudgetConfig:
+    """Execution time-budget controller configuration."""
+
+    enabled: bool = True
+    soft_limit_seconds: int = 240
+    hard_limit_seconds: int = 300
+
+
+@dataclass
+class RunGuardConfig:
+    """Deterministic runtime guardrail configuration."""
+
+    enabled: bool = True
+    max_tool_calls_total: int = 60
+    max_tool_calls_per_tool: Dict[str, int] = field(default_factory=lambda: {
+        "read_file": 30,
+        "grep": 20,
+        "glob": 20,
+        "write_file": 20,
+        "edit_file": 30,
+        "spawn_subagent": 10,
+        "spawn_parallel": 6,
+        "run_subagent_workflow": 4,
+    })
+    max_same_tool_input_repeats: int = 4
+    max_failure_streak: int = 6
+    max_subagent_rounds: int = 8
+    max_parallel_subagents: int = 5
+    require_verification_before_done: bool = True
+    verification_tool_names: List[str] = field(default_factory=lambda: [
+        "execute",
+        "execute_python",
+        "sql_query",
+        "wait_subagent",
+        "wait_all_subagents",
+    ])
+    completion_required_paths: List[str] = field(default_factory=list)
+    completion_required_patterns: List[str] = field(default_factory=list)
+
+
+@dataclass
 class PlanningConfig:
     """Planning middleware configuration."""
 
@@ -196,7 +295,14 @@ class DeepAgentConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     caching: CachingConfig = field(default_factory=CachingConfig)
     retry: RetryConfig = field(default_factory=RetryConfig)
+    local_context: LocalContextConfig = field(default_factory=LocalContextConfig)
+    loop_detection: LoopDetectionConfig = field(default_factory=LoopDetectionConfig)
+    verification: VerificationConfig = field(default_factory=VerificationConfig)
+    tracing: TracingConfig = field(default_factory=TracingConfig)
     reasoning: Any = None  # ReasoningConfig, set via from_dict or VelHarness
+    reasoning_scheduler: ReasoningSchedulerConfig = field(default_factory=ReasoningSchedulerConfig)
+    time_budget: TimeBudgetConfig = field(default_factory=TimeBudgetConfig)
+    run_guard: RunGuardConfig = field(default_factory=RunGuardConfig)
 
     # Agent policies
     max_turns: int = 50
@@ -382,11 +488,104 @@ class DeepAgentConfig:
             elif isinstance(retry_data, bool):
                 config.retry = RetryConfig(enabled=retry_data)
 
+        # Local context
+        if "local_context" in data:
+            lc_data = data["local_context"]
+            if isinstance(lc_data, dict):
+                config.local_context = LocalContextConfig(
+                    enabled=lc_data.get("enabled", True),
+                    max_entries=lc_data.get("max_entries", 40),
+                    max_depth=lc_data.get("max_depth", 1),
+                    detect_tools=lc_data.get("detect_tools", LocalContextConfig().detect_tools),
+                )
+            elif isinstance(lc_data, bool):
+                config.local_context = LocalContextConfig(enabled=lc_data)
+
+        # Loop detection
+        if "loop_detection" in data:
+            ld_data = data["loop_detection"]
+            if isinstance(ld_data, dict):
+                config.loop_detection = LoopDetectionConfig(
+                    enabled=ld_data.get("enabled", True),
+                    file_edit_threshold=ld_data.get("file_edit_threshold", 4),
+                    failure_streak_threshold=ld_data.get("failure_streak_threshold", 3),
+                )
+            elif isinstance(ld_data, bool):
+                config.loop_detection = LoopDetectionConfig(enabled=ld_data)
+
+        # Verification
+        if "verification" in data:
+            v_data = data["verification"]
+            if isinstance(v_data, dict):
+                config.verification = VerificationConfig(
+                    enabled=v_data.get("enabled", True),
+                    strict=v_data.get("strict", True),
+                    max_followups=v_data.get("max_followups", 2),
+                )
+            elif isinstance(v_data, bool):
+                config.verification = VerificationConfig(enabled=v_data)
+
+        # Tracing
+        if "tracing" in data:
+            t_data = data["tracing"]
+            if isinstance(t_data, dict):
+                config.tracing = TracingConfig(
+                    enabled=t_data.get("enabled", True),
+                    emit_langfuse=t_data.get("emit_langfuse", False),
+                )
+            elif isinstance(t_data, bool):
+                config.tracing = TracingConfig(enabled=t_data)
+
         # Reasoning
         if "reasoning" in data:
             from vel_harness.reasoning import ReasoningConfig as RC
 
             config.reasoning = RC.from_value(data["reasoning"])
+
+        # Reasoning scheduler
+        if "reasoning_scheduler" in data:
+            rs_data = data["reasoning_scheduler"]
+            if isinstance(rs_data, dict):
+                config.reasoning_scheduler = ReasoningSchedulerConfig(
+                    enabled=rs_data.get("enabled", True),
+                    planning_budget_tokens=rs_data.get("planning_budget_tokens", 12_000),
+                    build_budget_tokens=rs_data.get("build_budget_tokens", 5_000),
+                    verify_budget_tokens=rs_data.get("verify_budget_tokens", 15_000),
+                )
+            elif isinstance(rs_data, bool):
+                config.reasoning_scheduler = ReasoningSchedulerConfig(enabled=rs_data)
+
+        # Time budget
+        if "time_budget" in data:
+            tb_data = data["time_budget"]
+            if isinstance(tb_data, dict):
+                config.time_budget = TimeBudgetConfig(
+                    enabled=tb_data.get("enabled", True),
+                    soft_limit_seconds=tb_data.get("soft_limit_seconds", 240),
+                    hard_limit_seconds=tb_data.get("hard_limit_seconds", 300),
+                )
+            elif isinstance(tb_data, bool):
+                config.time_budget = TimeBudgetConfig(enabled=tb_data)
+
+        # Run guard
+        if "run_guard" in data:
+            rg_data = data["run_guard"]
+            if isinstance(rg_data, dict):
+                config.run_guard = RunGuardConfig(
+                    enabled=rg_data.get("enabled", True),
+                    max_tool_calls_total=rg_data.get("max_tool_calls_total", 60),
+                    max_tool_calls_per_tool=rg_data.get("max_tool_calls_per_tool", RunGuardConfig().max_tool_calls_per_tool),
+                    max_same_tool_input_repeats=rg_data.get("max_same_tool_input_repeats", 4),
+                    max_failure_streak=rg_data.get("max_failure_streak", 6),
+                    max_subagent_rounds=rg_data.get("max_subagent_rounds", 8),
+                    max_parallel_subagents=rg_data.get("max_parallel_subagents", 5),
+                    require_verification_before_done=rg_data.get("require_verification_before_done", True),
+                    verification_tool_names=rg_data.get("verification_tool_names", RunGuardConfig().verification_tool_names),
+                    completion_required_paths=rg_data.get("completion_required_paths", []),
+                    completion_required_patterns=rg_data.get("completion_required_patterns", []),
+                )
+            elif isinstance(rg_data, bool):
+                config.run_guard = RunGuardConfig(enabled=rg_data)
 
         # Fallback model
         if "fallback_model" in data:
@@ -421,6 +620,7 @@ class DeepAgentConfig:
                 "network": self.sandbox.network,
                 "timeout": self.sandbox.timeout,
                 "allowed_paths": self.sandbox.allowed_paths,
+                "fallback_unsandboxed": self.sandbox.fallback_unsandboxed,
                 "auto_allow_execute_if_sandboxed": self.sandbox.auto_allow_execute_if_sandboxed,
                 "excluded_commands": self.sandbox.excluded_commands,
                 "allowed_commands": self.sandbox.allowed_commands,
@@ -469,9 +669,53 @@ class DeepAgentConfig:
                 "circuit_failure_threshold": self.retry.circuit_failure_threshold,
                 "circuit_reset_timeout": self.retry.circuit_reset_timeout,
             },
+            "local_context": {
+                "enabled": self.local_context.enabled,
+                "max_entries": self.local_context.max_entries,
+                "max_depth": self.local_context.max_depth,
+                "detect_tools": self.local_context.detect_tools,
+            },
+            "loop_detection": {
+                "enabled": self.loop_detection.enabled,
+                "file_edit_threshold": self.loop_detection.file_edit_threshold,
+                "failure_streak_threshold": self.loop_detection.failure_streak_threshold,
+            },
+            "verification": {
+                "enabled": self.verification.enabled,
+                "strict": self.verification.strict,
+                "max_followups": self.verification.max_followups,
+            },
+            "tracing": {
+                "enabled": self.tracing.enabled,
+                "emit_langfuse": self.tracing.emit_langfuse,
+            },
             "reasoning": {
                 "mode": self.reasoning.mode if self.reasoning else "none",
             } if self.reasoning else None,
+            "reasoning_scheduler": {
+                "enabled": self.reasoning_scheduler.enabled,
+                "planning_budget_tokens": self.reasoning_scheduler.planning_budget_tokens,
+                "build_budget_tokens": self.reasoning_scheduler.build_budget_tokens,
+                "verify_budget_tokens": self.reasoning_scheduler.verify_budget_tokens,
+            },
+            "time_budget": {
+                "enabled": self.time_budget.enabled,
+                "soft_limit_seconds": self.time_budget.soft_limit_seconds,
+                "hard_limit_seconds": self.time_budget.hard_limit_seconds,
+            },
+            "run_guard": {
+                "enabled": self.run_guard.enabled,
+                "max_tool_calls_total": self.run_guard.max_tool_calls_total,
+                "max_tool_calls_per_tool": self.run_guard.max_tool_calls_per_tool,
+                "max_same_tool_input_repeats": self.run_guard.max_same_tool_input_repeats,
+                "max_failure_streak": self.run_guard.max_failure_streak,
+                "max_subagent_rounds": self.run_guard.max_subagent_rounds,
+                "max_parallel_subagents": self.run_guard.max_parallel_subagents,
+                "require_verification_before_done": self.run_guard.require_verification_before_done,
+                "verification_tool_names": self.run_guard.verification_tool_names,
+                "completion_required_paths": self.run_guard.completion_required_paths,
+                "completion_required_patterns": self.run_guard.completion_required_patterns,
+            },
             "fallback_model": self.fallback_model,
             "max_fallback_retries": self.max_fallback_retries,
         }

@@ -27,6 +27,10 @@ from .tools.todo import TODO_WRITE_PROMPT
 # Agent prompts
 from .agents.explore import EXPLORE_AGENT_PROMPT
 from .agents.plan import PLAN_AGENT_PROMPT
+from .agents.discover import DISCOVER_AGENT_PROMPT
+from .agents.implement import IMPLEMENT_AGENT_PROMPT
+from .agents.verify import VERIFY_AGENT_PROMPT
+from .agents.critic import CRITIC_AGENT_PROMPT
 
 # Utility prompts (P1)
 from .utilities import COMPACTION_PROMPT
@@ -119,12 +123,20 @@ def compose_agent_prompt(
     agent_prompts = {
         "explore": EXPLORE_AGENT_PROMPT,
         "plan": PLAN_AGENT_PROMPT,
+        "discover": DISCOVER_AGENT_PROMPT,
+        "implement": IMPLEMENT_AGENT_PROMPT,
+        "verify": VERIFY_AGENT_PROMPT,
+        "critic": CRITIC_AGENT_PROMPT,
     }
 
     # Tool subsets for each agent type
     agent_tools = {
         "explore": ["read_file", "ls", "glob", "grep", "execute"],
         "plan": ["read_file", "ls", "glob", "grep", "write_todos", "read_todos"],
+        "discover": ["read_file", "ls", "glob", "grep", "execute"],
+        "implement": ["read_file", "write_file", "edit_file", "ls", "glob", "grep", "execute"],
+        "verify": ["read_file", "ls", "glob", "grep", "execute"],
+        "critic": ["read_file", "ls", "glob", "grep", "execute", "write_todos"],
     }
 
     # Compose base prompt with appropriate tool subset
@@ -169,6 +181,10 @@ __all__ = [
     # Agent prompts
     "EXPLORE_AGENT_PROMPT",
     "PLAN_AGENT_PROMPT",
+    "DISCOVER_AGENT_PROMPT",
+    "IMPLEMENT_AGENT_PROMPT",
+    "VERIFY_AGENT_PROMPT",
+    "CRITIC_AGENT_PROMPT",
 
     # Utility prompts
     "COMPACTION_PROMPT",

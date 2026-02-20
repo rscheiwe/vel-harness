@@ -58,6 +58,38 @@ DEFAULT_AGENTS: Dict[str, AgentConfig] = {
         timeout=180.0,
         description="Structured planning and task breakdown",
     ),
+    "discover": AgentConfig(
+        name="discover",
+        system_prompt="",
+        tools=["read_file", "ls", "glob", "grep", "execute"],
+        max_turns=25,
+        timeout=180.0,
+        description="Discovery-focused repo mapping and constraints gathering",
+    ),
+    "implement": AgentConfig(
+        name="implement",
+        system_prompt="",
+        tools=["execute", "read_file", "write_file", "edit_file", "ls", "glob", "grep"],
+        max_turns=40,
+        timeout=240.0,
+        description="Implementation-focused coding and integration",
+    ),
+    "verify": AgentConfig(
+        name="verify",
+        system_prompt="",
+        tools=["execute", "read_file", "ls", "glob", "grep"],
+        max_turns=25,
+        timeout=180.0,
+        description="Verification-focused test execution and spec compliance checks",
+    ),
+    "critic": AgentConfig(
+        name="critic",
+        system_prompt="",
+        tools=["read_file", "ls", "glob", "grep", "execute", "write_todos"],
+        max_turns=20,
+        timeout=180.0,
+        description="Independent critical review for correctness and robustness",
+    ),
 }
 
 
@@ -136,6 +168,14 @@ class AgentRegistry:
                 return compose_agent_prompt("explore")
             elif agent_type == "plan":
                 return compose_agent_prompt("plan")
+            elif agent_type == "discover":
+                return compose_agent_prompt("discover")
+            elif agent_type == "implement":
+                return compose_agent_prompt("implement")
+            elif agent_type == "verify":
+                return compose_agent_prompt("verify")
+            elif agent_type == "critic":
+                return compose_agent_prompt("critic")
             else:  # default
                 return compose_system_prompt()
         except ImportError:
@@ -171,6 +211,22 @@ class AgentRegistry:
                 "- Consider edge cases and risks\n"
                 "- Output a clear, actionable plan\n"
                 "- Use write_todos to structure the plan"
+            ),
+            "discover": (
+                "You are a discovery agent. Map relevant files, interfaces, and constraints quickly.\n"
+                "Identify how the task should be verified."
+            ),
+            "implement": (
+                "You are an implementation agent. Make focused code changes aligned to the task spec,\n"
+                "and prepare deterministic verification steps."
+            ),
+            "verify": (
+                "You are a verification agent. Validate behavior against the original spec,\n"
+                "run tests/checks, and report pass/fail evidence."
+            ),
+            "critic": (
+                "You are a critic agent. Challenge assumptions and look for correctness gaps,\n"
+                "missing tests, and brittle approaches."
             ),
         }
 

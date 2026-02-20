@@ -6,6 +6,7 @@ tool execution when the model requests multiple tools in the same step.
 """
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime
@@ -37,9 +38,14 @@ class ApprovalManager:
 
     def __init__(self) -> None:
         self._pending: Dict[str, tuple[PendingApproval, asyncio.Future]] = {}
-        self._stored_approvals: Dict[str, bool] = {}
+        self._stored_approvals_by_key: Dict[str, bool] = {}
+        self._stored_approvals_by_tool: Dict[str, List[bool]] = {}
         self._id_counter = 0
         self._callbacks: List[Callable[[PendingApproval], None]] = []
+
+    def _approval_key(self, tool_name: str, args: Dict[str, Any]) -> str:
+        args_json = json.dumps(args, sort_keys=True, default=str)
+        return f"{tool_name}:{args_json}"
 
     def on_approval_needed(self, callback: Callable[[PendingApproval], None]) -> None:
         """Register a callback for when approval is needed."""
@@ -57,9 +63,18 @@ class ApprovalManager:
         Checks for pre-stored approvals first (for when user approved
         before execute() was called).
         """
-        # Check if user already responded (via UI before execute() was called)
-        if tool_name in self._stored_approvals:
-            approved = self._stored_approvals.pop(tool_name)
+        key = self._approval_key(tool_name, args)
+
+        # Check if user already responded (exact call match)
+        if key in self._stored_approvals_by_key:
+            approved = self._stored_approvals_by_key.pop(key)
+            return approved
+        # Backward-compatible fallback by tool name queue.
+        queue = self._stored_approvals_by_tool.get(tool_name)
+        if queue:
+            approved = queue.pop(0)
+            if not queue:
+                self._stored_approvals_by_tool.pop(tool_name, None)
             return approved
 
         self._id_counter += 1
@@ -103,14 +118,34 @@ class ApprovalManager:
         If the approval is already pending, resolves it.
         If not yet pending (user responded early), stores for later.
         """
-        # Check if there's a pending approval for this tool
-        for approval_id, (approval, _) in list(self._pending.items()):
-            if approval.tool_name == tool_name:
-                return self.respond(approval_id, approved)
+        # Check if there's a pending approval for this tool. If more than one,
+        # do not auto-resolve to avoid approving the wrong tool call.
+        matches = [
+            approval_id
+            for approval_id, (approval, _) in self._pending.items()
+            if approval.tool_name == tool_name
+        ]
+        if len(matches) == 1:
+            return self.respond(matches[0], approved)
+        if len(matches) > 1:
+            return False
 
         # No pending approval - user responded before execute() was called
-        # Store for later
-        self._stored_approvals[tool_name] = approved
+        self._stored_approvals_by_tool.setdefault(tool_name, []).append(approved)
+        return True
+
+    def respond_by_tool_args(
+        self,
+        tool_name: str,
+        args: Dict[str, Any],
+        approved: bool,
+    ) -> bool:
+        """Respond using exact tool name + args matching."""
+        key = self._approval_key(tool_name, args)
+        for approval_id, (approval, _) in list(self._pending.items()):
+            if self._approval_key(approval.tool_name, approval.args) == key:
+                return self.respond(approval_id, approved)
+        self._stored_approvals_by_key[key] = approved
         return True
 
     def get_pending(self) -> List[PendingApproval]:
@@ -139,3 +174,5 @@ class ApprovalManager:
             if not future.done():
                 future.set_result(False)
         self._pending.clear()
+        self._stored_approvals_by_key.clear()
+        self._stored_approvals_by_tool.clear()

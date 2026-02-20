@@ -128,6 +128,16 @@ def skills_middleware(temp_skills_dir: Path) -> SkillsMiddleware:
     return SkillsMiddleware(skill_dirs=[str(temp_skills_dir)])
 
 
+@pytest.fixture
+def tool_result_middleware(temp_skills_dir: Path) -> SkillsMiddleware:
+    """Create middleware with TOOL_RESULT injection mode."""
+    return SkillsMiddleware(
+        skill_dirs=[str(temp_skills_dir)],
+        auto_activate=False,
+        injection_mode=SkillInjectionMode.TOOL_RESULT,
+    )
+
+
 # parse_frontmatter Tests
 
 
@@ -445,7 +455,7 @@ class TestSkillsMiddleware:
         """Test activating skill via middleware."""
         result = skills_middleware._activate_skill("Data Analysis")
 
-        assert result["status"] == "activated"
+        assert result["status"] == "loaded"
         assert result["skill"] == "Data Analysis"
 
     def test_activate_nonexistent(self, skills_middleware: SkillsMiddleware) -> None:
@@ -516,7 +526,7 @@ class TestSkillsIntegration:
 
         # Activate skill
         activate_result = skills_middleware._activate_skill("Data Analysis")
-        assert activate_result["status"] == "activated"
+        assert activate_result["status"] == "loaded"
 
         # Get skill content
         skill_content = skills_middleware._get_skill("Data Analysis")

@@ -187,13 +187,15 @@ class TestPlanningMiddleware:
         """Test that middleware returns tools."""
         tools = planning_middleware.get_tools()
 
-        assert len(tools) == 1
-        assert tools[0].name == "write_todos"
+        tool_names = [t.name for t in tools]
+        assert "write_todos" in tool_names
+        assert "read_todos" in tool_names
 
     def test_tool_has_correct_category(self, planning_middleware: PlanningMiddleware) -> None:
         """Test that tool has planning category."""
         tools = planning_middleware.get_tools()
-        assert tools[0].category == "planning"
+        for tool in tools:
+            assert tool.category == "planning"
 
     def test_system_prompt_segment(self, planning_middleware: PlanningMiddleware) -> None:
         """Test system prompt segment."""
@@ -297,6 +299,17 @@ class TestPlanningMiddleware:
         )
 
         assert "todo_list" in result
+        assert "Step 1" in result["todo_list"]
+
+    def test_read_todos(self, planning_middleware: PlanningMiddleware) -> None:
+        """Test reading todo state."""
+        planning_middleware.write_todos(
+            current_task="Testing",
+            next_steps=["Step 1", "Step 2"],
+        )
+        result = planning_middleware.read_todos()
+        assert result["current_task"] == "Testing"
+        assert result["pending_count"] == 2
         assert "Step 1" in result["todo_list"]
 
     def test_state_persistence(self, planning_middleware: PlanningMiddleware) -> None:

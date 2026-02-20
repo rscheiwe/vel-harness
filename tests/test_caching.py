@@ -255,7 +255,8 @@ class TestToolCachingMiddleware:
         result = middleware.cache_result("write_file", {}, {"status": "ok"})
         assert result is False
 
-    def test_wrap_tool(self, middleware):
+    @pytest.mark.asyncio
+    async def test_wrap_tool(self, middleware):
         """Test wrapping a tool with caching."""
         call_count = 0
 
@@ -273,12 +274,12 @@ class TestToolCachingMiddleware:
         wrapped = middleware.wrap_tool(tool)
 
         # First call executes handler
-        result1 = wrapped._handler()
+        result1 = await wrapped._handler()
         assert result1 == ["users", "orders"]
         assert call_count == 1
 
         # Second call uses cache
-        result2 = wrapped._handler()
+        result2 = await wrapped._handler()
         assert result2 == ["users", "orders"]
         assert call_count == 1  # Not incremented
 
