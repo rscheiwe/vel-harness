@@ -10,9 +10,11 @@ from pathlib import Path
 import pytest
 
 from vel_harness.skills.loader import (
+    DISCOVERY_MODE_ENTRYPOINT_ONLY,
     Skill,
     SkillParseError,
     load_skill,
+    load_skill_inventory_from_directory,
     load_skills_from_directory,
     parse_frontmatter,
 )
@@ -114,6 +116,48 @@ Advanced content here.
 """)
 
         yield skills_dir
+
+
+@pytest.fixture
+def temp_entrypoint_skills_dir() -> Path:
+    """Create a temporary skill package with SKILL.md + assets."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        pkg = root / "billing"
+        (pkg / "recipes").mkdir(parents=True)
+        (pkg / "reference").mkdir(parents=True)
+
+        (pkg / "SKILL.md").write_text("""---
+name: Billing Ops
+description: Resolve billing workflows
+tags:
+  - billing
+triggers:
+  - billing case
+---
+
+# Billing Ops
+Use canonical billing workflow.
+""")
+        (pkg / "recipes" / "playbook.md").write_text(
+            "# Billing Playbook\n\nUse this for reference-only steps.\n"
+        )
+        (pkg / "reference" / "notes.md").write_text(
+            "# Billing Notes\n\nTroubleshooting notes.\n"
+        )
+        # Markdown with skill frontmatter contract should be discoverable as skill.
+        (root / "ad_hoc_skill.md").write_text("""---
+name: Escalation
+description: Escalation policy
+kind: skill
+---
+
+# Escalation
+Escalate after SLA breach.
+""")
+        # This should remain an asset in entrypoint mode.
+        (root / "README.md").write_text("# Package Readme\n")
+        yield root
 
 
 @pytest.fixture
@@ -344,6 +388,31 @@ class TestLoadSkillsFromDirectory:
         priorities = [s.priority for s in skills]
         assert priorities == sorted(priorities, reverse=True)
 
+    def test_entrypoint_mode_only_loads_entrypoints(
+        self, temp_entrypoint_skills_dir: Path
+    ) -> None:
+        """Entrypoint mode should load SKILL.md and explicit frontmatter skills only."""
+        skills = load_skills_from_directory(
+            temp_entrypoint_skills_dir,
+            discovery_mode=DISCOVERY_MODE_ENTRYPOINT_ONLY,
+        )
+        names = [s.name for s in skills]
+        assert "Billing Ops" in names
+        assert "Escalation" in names
+        assert all(name not in names for name in ["Playbook", "Notes"])
+
+    def test_entrypoint_mode_collects_assets(
+        self, temp_entrypoint_skills_dir: Path
+    ) -> None:
+        """Entrypoint mode should classify non-entrypoint markdown as assets."""
+        _skills, assets = load_skill_inventory_from_directory(
+            temp_entrypoint_skills_dir,
+            discovery_mode=DISCOVERY_MODE_ENTRYPOINT_ONLY,
+        )
+        paths = [asset.source_path for asset in assets]
+        assert any(path.endswith("recipes/playbook.md") for path in paths)
+        assert any(path.endswith("reference/notes.md") for path in paths)
+
 
 # SkillsRegistry Tests
 
@@ -419,6 +488,43 @@ class TestSkillsRegistry:
 
         assert "Data Analysis" in state["active_skills"]
 
+    def test_entrypoint_assets_by_skill(
+        self, temp_entrypoint_skills_dir: Path
+    ) -> None:
+        """Registry should expose assets under the associated skill."""
+        entrypoint_registry = SkillsRegistry(
+            skill_dirs=[str(temp_entrypoint_skills_dir)],
+            discovery_mode=DISCOVERY_MODE_ENTRYPOINT_ONLY,
+        )
+        assets = entrypoint_registry.list_skill_assets("Billing Ops")
+        assert len(assets) >= 2
+        assert all(asset["skill_name"] == "Billing Ops" for asset in assets)
+
+    def test_activation_fails_for_ambiguous_name(self, temp_skills_dir: Path) -> None:
+        """Activation should fail with deterministic error when name is ambiguous."""
+        first_dir = temp_skills_dir / "dup_a"
+        second_dir = temp_skills_dir / "dup_b"
+        first_dir.mkdir()
+        second_dir.mkdir()
+        (first_dir / "SKILL.md").write_text("""---
+name: Duplicate Skill
+description: First
+---
+""")
+        (second_dir / "SKILL.md").write_text("""---
+name: Duplicate Skill
+description: Second
+---
+""")
+        dup_registry = SkillsRegistry(
+            skill_dirs=[str(first_dir), str(second_dir)],
+            discovery_mode=DISCOVERY_MODE_ENTRYPOINT_ONLY,
+        )
+        assert dup_registry.activate_skill("Duplicate Skill") is False
+        error = dup_registry.get_activation_error("Duplicate Skill")
+        assert error is not None
+        assert "ambiguous" in error.lower()
+
 
 # SkillsMiddleware Tests
 
@@ -436,6 +542,7 @@ class TestSkillsMiddleware:
         assert "deactivate_skill" in tool_names
         assert "get_skill" in tool_names
         assert "search_skills" in tool_names
+        assert "list_skill_assets" in tool_names
 
     def test_tool_categories(self, skills_middleware: SkillsMiddleware) -> None:
         """Test that tools have correct categories."""
@@ -485,6 +592,17 @@ class TestSkillsMiddleware:
 
         assert result["count"] >= 1
         assert any(r["name"] == "Research Workflow" for r in result["results"])
+
+    def test_list_skill_assets(self, temp_entrypoint_skills_dir: Path) -> None:
+        """Middleware should return assets for a specific skill."""
+        middleware = SkillsMiddleware(
+            skill_dirs=[str(temp_entrypoint_skills_dir)],
+            auto_activate=False,
+            discovery_mode=DISCOVERY_MODE_ENTRYPOINT_ONLY,
+        )
+        result = middleware._list_skill_assets("Billing Ops")
+        assert result["count"] >= 2
+        assert any(asset["source_path"].endswith("playbook.md") for asset in result["assets"])
 
     def test_system_prompt_segment(self, skills_middleware: SkillsMiddleware) -> None:
         """Test system prompt content."""

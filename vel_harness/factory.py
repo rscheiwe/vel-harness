@@ -23,7 +23,7 @@ import warnings
 import contextvars
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from vel import Agent, ToolSpec
 
@@ -75,6 +75,76 @@ _TODO_NUDGE_RE = re.compile(
     r"\b(implement|fix|bug|refactor|code|function|test|suite|compile|build|workflow|subagent|parallel)\b",
     flags=re.IGNORECASE,
 )
+
+ToolInputRewriter = Callable[
+    [str, Dict[str, Any], Optional[str]],
+    Union[Dict[str, Any], tuple[Dict[str, Any], Optional[str]], None],
+]
+
+
+def _is_tool_output_failure(result: Any) -> tuple[bool, str, str]:
+    """Best-effort failure extraction for non-exception tool outputs."""
+    if not isinstance(result, dict):
+        return False, "", ""
+
+    status_val = str(result.get("status", "")).strip().lower()
+    success_val = result.get("success")
+    exit_code = result.get("exit_code")
+    stderr = str(result.get("stderr", "") or "")
+    error_text = str(result.get("error", "") or "")
+
+    failed = False
+    if isinstance(success_val, bool):
+        failed = failed or (not success_val)
+    if isinstance(exit_code, int):
+        failed = failed or (exit_code != 0)
+    if status_val in {"error", "failed", "failure"}:
+        failed = True
+
+    if not failed:
+        return False, "", ""
+
+    if error_text:
+        return True, error_text, "ToolOutputError"
+    if stderr:
+        return True, stderr, "ToolOutputStderr"
+    if isinstance(exit_code, int) and exit_code != 0:
+        return True, f"Tool exited with non-zero exit_code={exit_code}", "ToolExitCode"
+    if isinstance(success_val, bool) and not success_val:
+        return True, "Tool reported success=false", "ToolOutputFailure"
+    if status_val:
+        return True, f"Tool status indicates failure: {status_val}", "ToolOutputStatus"
+    return True, "Tool output indicates failure", "ToolOutputFailure"
+
+
+def _apply_tool_input_rewriters(
+    tool_name: str,
+    kwargs: Dict[str, Any],
+    working_dir: Optional[str],
+    rewriters: List[ToolInputRewriter],
+) -> tuple[Dict[str, Any], List[str]]:
+    """Apply external tool input rewriters in order."""
+    if not rewriters:
+        return kwargs, []
+
+    current = dict(kwargs)
+    reasons: List[str] = []
+
+    for rewriter in rewriters:
+        rewritten = rewriter(tool_name, dict(current), working_dir)
+        if rewritten is None:
+            continue
+        if isinstance(rewritten, tuple) and len(rewritten) == 2:
+            candidate, reason = rewritten
+            if isinstance(candidate, dict):
+                current = candidate
+            if isinstance(reason, str) and reason.strip():
+                reasons.append(reason.strip())
+            continue
+        if isinstance(rewritten, dict):
+            current = rewritten
+
+    return current, reasons
 
 
 class DeepAgent:
@@ -296,7 +366,7 @@ class DeepAgent:
         if self.time_budget is not None:
             self.time_budget.start(sid)
         if self.run_guard is not None:
-            self.run_guard.start(sid)
+            self.run_guard.start(sid, input_text if isinstance(input_text, str) else "")
 
         run_ctx = None
         if self.tracing is not None:
@@ -396,7 +466,7 @@ class DeepAgent:
         if self.time_budget is not None:
             self.time_budget.start(sid)
         if self.run_guard is not None:
-            self.run_guard.start(sid)
+            self.run_guard.start(sid, input_text if isinstance(input_text, str) else "")
 
         reasoning_cfg = self._config.reasoning
         parser = None
@@ -506,7 +576,7 @@ class DeepAgent:
                 rg_followup_needed, rg_followup_reason = self.run_guard.should_force_followup(
                     session_id=sid,
                     user_message=input_text,
-                    response="",
+                    response="".join(final_output_chunks),
                 )
 
             if followup_needed or rg_followup_needed:
@@ -1001,6 +1071,7 @@ def create_deep_agent(
             skill_dirs=agent_config.skills.skill_dirs,
             auto_activate=agent_config.skills.auto_activate,
             max_active_skills=agent_config.skills.max_active_skills,
+            discovery_mode=agent_config.skills.discovery_mode,
         )
         middlewares["skills"] = skills
         all_tools.extend(skills.get_tools())
@@ -1114,6 +1185,7 @@ def create_deep_agent(
         tracing_mw = TracingMiddleware(
             enabled=agent_config.tracing.enabled,
             emit_langfuse=agent_config.tracing.emit_langfuse,
+            telemetry_mode=agent_config.tracing.telemetry_mode,
         )
         middlewares["tracing"] = tracing_mw
 
@@ -1141,6 +1213,11 @@ def create_deep_agent(
                 verification_tool_names=agent_config.run_guard.verification_tool_names,
                 completion_required_paths=agent_config.run_guard.completion_required_paths,
                 completion_required_patterns=agent_config.run_guard.completion_required_patterns,
+                max_discovery_rounds_by_class=agent_config.run_guard.max_discovery_rounds_by_class,
+                max_repeated_identical_execute=agent_config.run_guard.max_repeated_identical_execute,
+                enforce_query_evidence_for_numeric_claims=(
+                    agent_config.run_guard.enforce_query_evidence_for_numeric_claims
+                ),
             )
         )
         middlewares["run_guard"] = run_guard_mw
@@ -1448,38 +1525,77 @@ def create_deep_agent(
     if tool_observers:
         import asyncio as _asyncio
         import time as _time
+        tool_input_rewriters: List[ToolInputRewriter] = list(
+            getattr(agent_config, "tool_input_rewriters", []) or []
+        )
 
         def _notify_observers(tool: ToolSpec) -> ToolSpec:
             original_handler = tool._handler
 
             async def observed_handler(**kwargs: Any) -> Any:
                 session_id = _active_session_id.get()
+                effective_kwargs, rewrite_reasons = _apply_tool_input_rewriters(
+                    tool_name=tool.name,
+                    kwargs=kwargs,
+                    working_dir=agent_config.sandbox.working_dir,
+                    rewriters=tool_input_rewriters,
+                )
                 for obs in tool_observers:
                     if hasattr(obs, "allow_tool_call"):
-                        allowed, reason = obs.allow_tool_call(session_id, tool.name, kwargs)
+                        allowed, reason = obs.allow_tool_call(session_id, tool.name, effective_kwargs)
                         if not allowed:
                             if hasattr(obs, "on_tool_failure"):
-                                obs.on_tool_failure(session_id, tool.name, kwargs)
+                                obs.on_tool_failure(session_id, tool.name, effective_kwargs)
                             return {"error": reason}
                 for obs in tool_observers:
                     if hasattr(obs, "record_tool_start"):
-                        obs.record_tool_start(tool.name, kwargs)
+                        obs.record_tool_start(tool.name, effective_kwargs)
                     if hasattr(obs, "on_tool_start"):
-                        obs.on_tool_start(session_id, tool.name, kwargs)
+                        obs.on_tool_start(session_id, tool.name, effective_kwargs)
 
                 started = _time.time()
                 try:
+                    if rewrite_reasons:
+                        for rewrite_reason in rewrite_reasons:
+                            for obs in tool_observers:
+                                if hasattr(obs, "record"):
+                                    try:
+                                        obs.record(  # type: ignore[attr-defined]
+                                            "tool-input-rewritten",
+                                            {
+                                                "tool_name": tool.name,
+                                                "reason": rewrite_reason,
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
+
                     if _asyncio.iscoroutinefunction(original_handler):
-                        result = await original_handler(**kwargs)
+                        result = await original_handler(**effective_kwargs)
                     else:
-                        result = original_handler(**kwargs)
+                        result = original_handler(**effective_kwargs)
 
                     duration_ms = (_time.time() - started) * 1000
+                    output_failed, output_error, output_error_type = _is_tool_output_failure(result)
+                    if output_failed:
+                        for obs in tool_observers:
+                            if hasattr(obs, "record_tool_failure"):
+                                obs.record_tool_failure(
+                                    tool.name,
+                                    effective_kwargs,
+                                    output_error,
+                                    duration_ms,
+                                    error_type=output_error_type,
+                                )
+                            if hasattr(obs, "on_tool_failure"):
+                                obs.on_tool_failure(session_id, tool.name, effective_kwargs)
+                        return result
+
                     for obs in tool_observers:
                         if hasattr(obs, "record_tool_success"):
-                            obs.record_tool_success(tool.name, kwargs, duration_ms, result)
+                            obs.record_tool_success(tool.name, effective_kwargs, duration_ms, result)
                         if hasattr(obs, "on_tool_success"):
-                            obs.on_tool_success(session_id, tool.name, kwargs)
+                            obs.on_tool_success(session_id, tool.name, effective_kwargs)
                     return result
                 except Exception as e:
                     duration_ms = (_time.time() - started) * 1000
@@ -1487,13 +1603,13 @@ def create_deep_agent(
                         if hasattr(obs, "record_tool_failure"):
                             obs.record_tool_failure(
                                 tool.name,
-                                kwargs,
+                                effective_kwargs,
                                 str(e),
                                 duration_ms,
                                 error_type=e.__class__.__name__,
                             )
                         if hasattr(obs, "on_tool_failure"):
-                            obs.on_tool_failure(session_id, tool.name, kwargs)
+                            obs.on_tool_failure(session_id, tool.name, effective_kwargs)
                     raise
 
             return ToolSpec.from_function(

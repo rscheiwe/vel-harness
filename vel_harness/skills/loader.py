@@ -18,6 +18,11 @@ class SkillParseError(Exception):
     pass
 
 
+DISCOVERY_MODE_ENTRYPOINT_ONLY = "entrypoint_only"
+DISCOVERY_MODE_LEGACY_MARKDOWN_SCAN = "legacy_markdown_scan"
+_SKIP_SKILL_FILENAMES = {"readme.md", "changelog.md", "license.md"}
+
+
 @dataclass
 class Skill:
     """
@@ -40,6 +45,8 @@ class Skill:
     author: Optional[str] = None
     version: Optional[str] = None
     requires: List[str] = field(default_factory=list)
+    kind: str = "skill"
+    entrypoint: bool = True
 
     def matches_query(self, query: str) -> bool:
         """
@@ -107,6 +114,8 @@ class Skill:
             "enabled": self.enabled,
             "content_length": len(self.content),
             "source_path": self.source_path,
+            "kind": self.kind,
+            "entrypoint": self.entrypoint,
         }
 
     def to_prompt_segment(self) -> str:
@@ -124,6 +133,30 @@ class Skill:
             self.content,
         ]
         return "\n".join(lines)
+
+
+@dataclass
+class SkillAsset:
+    """Reference document associated with a skill package."""
+
+    name: str
+    source_path: str
+    skill_name: Optional[str] = None
+    description: str = ""
+    tags: List[str] = field(default_factory=list)
+    kind: str = "knowledge_asset"
+    entrypoint: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "source_path": self.source_path,
+            "skill_name": self.skill_name,
+            "description": self.description,
+            "tags": self.tags,
+            "kind": self.kind,
+            "entrypoint": self.entrypoint,
+        }
 
 
 def parse_frontmatter(content: str) -> tuple[Dict[str, Any], str]:
@@ -182,10 +215,13 @@ def load_skill(path: Path) -> Skill:
     # Extract required fields
     name = frontmatter.get("name")
     if not name:
-        # Use filename as fallback
-        name = path.stem.replace("_", " ").replace("-", " ").title()
-        if name.lower().endswith(" skill"):
-            name = name[:-6]
+        # Use parent directory for SKILL.md entrypoints, otherwise filename.
+        if path.stem.lower() == "skill":
+            name = path.parent.name.replace("_", " ").replace("-", " ").title()
+        else:
+            name = path.stem.replace("_", " ").replace("-", " ").title()
+            if name.lower().endswith(" skill"):
+                name = name[:-6]
 
     description = frontmatter.get("description", "")
 
@@ -219,50 +255,166 @@ def load_skill(path: Path) -> Skill:
         author=author,
         version=version,
         requires=requires,
+        kind="skill",
+        entrypoint=_is_entrypoint_skill(path, frontmatter),
     )
+
+
+def _is_hidden_path(path: Path) -> bool:
+    return any(part.startswith(".") for part in path.parts)
+
+
+def _iter_markdown_files(directory: Path, recursive: bool = True) -> List[Path]:
+    if not directory.exists():
+        return []
+    glob_method = directory.rglob if recursive else directory.glob
+    files: List[Path] = []
+    for path in glob_method("*.md"):
+        if _is_hidden_path(path):
+            continue
+        files.append(path)
+    return files
+
+
+def _is_frontmatter_skill(frontmatter: Dict[str, Any]) -> bool:
+    kind = str(frontmatter.get("kind", "")).strip().lower()
+    if kind != "skill":
+        return False
+    name = frontmatter.get("name")
+    description = frontmatter.get("description")
+    return bool(name and description)
+
+
+def _is_entrypoint_skill(path: Path, frontmatter: Dict[str, Any]) -> bool:
+    if path.name == "SKILL.md":
+        return True
+    return _is_frontmatter_skill(frontmatter)
+
+
+def _discover_skill_paths(
+    files: List[Path],
+    discovery_mode: str,
+) -> List[Path]:
+    skill_paths: List[Path] = []
+    for path in files:
+        if path.name.lower() in _SKIP_SKILL_FILENAMES:
+            continue
+        if discovery_mode == DISCOVERY_MODE_LEGACY_MARKDOWN_SCAN:
+            skill_paths.append(path)
+            continue
+
+        try:
+            content = path.read_text(encoding="utf-8")
+            frontmatter, _ = parse_frontmatter(content)
+        except Exception:
+            frontmatter = {}
+
+        if _is_entrypoint_skill(path, frontmatter):
+            skill_paths.append(path)
+
+    return skill_paths
+
+
+def _find_parent_skill_name(path: Path, skill_roots: Dict[Path, str]) -> Optional[str]:
+    best_match: Optional[Path] = None
+    for root in skill_roots:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            continue
+        if best_match is None or len(root.parts) > len(best_match.parts):
+            best_match = root
+    if best_match is None:
+        return None
+    return skill_roots[best_match]
+
+
+def load_skill_inventory_from_directory(
+    directory: Path,
+    recursive: bool = True,
+    discovery_mode: str = DISCOVERY_MODE_ENTRYPOINT_ONLY,
+) -> tuple[List[Skill], List[SkillAsset]]:
+    """Load skills and reference assets from a directory."""
+    files = _iter_markdown_files(directory, recursive=recursive)
+    if not files:
+        return [], []
+
+    skill_paths = set(_discover_skill_paths(files, discovery_mode))
+    skills: List[Skill] = []
+    skill_roots: Dict[Path, str] = {}
+
+    for path in skill_paths:
+        try:
+            skill = load_skill(path)
+            skills.append(skill)
+            if skill.entrypoint:
+                skill_roots[path.parent] = skill.name
+        except SkillParseError:
+            continue
+
+    assets: List[SkillAsset] = []
+    for path in files:
+        if path in skill_paths:
+            continue
+
+        description = ""
+        name = path.stem.replace("_", " ").replace("-", " ").title()
+        tags: List[str] = []
+
+        try:
+            content = path.read_text(encoding="utf-8")
+            frontmatter, _ = parse_frontmatter(content)
+            if isinstance(frontmatter.get("name"), str) and frontmatter["name"].strip():
+                name = frontmatter["name"].strip()
+            if isinstance(frontmatter.get("description"), str):
+                description = frontmatter["description"]
+            frontmatter_tags = frontmatter.get("tags", [])
+            if isinstance(frontmatter_tags, str):
+                frontmatter_tags = [frontmatter_tags]
+            if isinstance(frontmatter_tags, list):
+                tags = [str(tag) for tag in frontmatter_tags]
+        except Exception:
+            pass
+
+        assets.append(
+            SkillAsset(
+                name=name,
+                source_path=str(path),
+                skill_name=_find_parent_skill_name(path, skill_roots),
+                description=description,
+                tags=tags,
+            )
+        )
+
+    skills.sort(key=lambda s: (-s.priority, s.name))
+    assets.sort(key=lambda a: (a.skill_name or "", a.name, a.source_path))
+    return skills, assets
 
 
 def load_skills_from_directory(
     directory: Path,
     pattern: str = "*.md",
     recursive: bool = True,
+    discovery_mode: str = DISCOVERY_MODE_ENTRYPOINT_ONLY,
 ) -> List[Skill]:
     """
     Load all skills from a directory.
 
     Args:
         directory: Directory containing skill files
-        pattern: Glob pattern for skill files
+        pattern: Glob pattern for skill files (kept for compatibility)
         recursive: Whether to search recursively
+        discovery_mode: Skill discovery mode
 
     Returns:
         List of loaded skills
     """
-    if not directory.exists():
-        return []
-
-    skills = []
-    glob_method = directory.rglob if recursive else directory.glob
-
-    for path in glob_method(pattern):
-        # Skip hidden files and directories
-        if any(part.startswith(".") for part in path.parts):
-            continue
-
-        # Skip non-skill files (e.g., README.md)
-        if path.name.lower() in ["readme.md", "changelog.md", "license.md"]:
-            continue
-
-        try:
-            skill = load_skill(path)
-            skills.append(skill)
-        except SkillParseError:
-            # Skip files that can't be parsed as skills
-            continue
-
-    # Sort by priority (higher first), then name
-    skills.sort(key=lambda s: (-s.priority, s.name))
-
+    _ = pattern  # compatibility with existing API
+    skills, _assets = load_skill_inventory_from_directory(
+        directory=directory,
+        recursive=recursive,
+        discovery_mode=discovery_mode,
+    )
     return skills
 
 
@@ -270,6 +422,7 @@ def load_skills_from_directories(
     directories: List[Path],
     pattern: str = "*.md",
     recursive: bool = True,
+    discovery_mode: str = DISCOVERY_MODE_ENTRYPOINT_ONLY,
 ) -> List[Skill]:
     """
     Load skills from multiple directories.
@@ -285,7 +438,7 @@ def load_skills_from_directories(
     all_skills: Dict[str, Skill] = {}
 
     for directory in directories:
-        skills = load_skills_from_directory(directory, pattern, recursive)
+        skills = load_skills_from_directory(directory, pattern, recursive, discovery_mode)
         for skill in skills:
             # Later directories override earlier ones
             all_skills[skill.name] = skill

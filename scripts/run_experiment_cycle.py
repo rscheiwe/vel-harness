@@ -15,10 +15,13 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from vel_harness.analysis import (
+    GateThresholds,
     analyze_trace_objects,
     compare_analysis_payloads,
+    evaluate_hardening_gates,
     fetch_langfuse_traces,
     normalize_trace_object,
+    update_default_flip_readiness,
 )
 
 
@@ -31,6 +34,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=100, help="Trace limit per side")
     parser.add_argument("--out-json", default="experiment_cycle.json", help="Output JSON report path")
     parser.add_argument("--out-md", default="experiment_cycle.md", help="Output markdown report path")
+    parser.add_argument("--out-gates", default="", help="Optional output path for gate evaluation JSON")
+    parser.add_argument(
+        "--gate-history",
+        default=".experiments/hardening_gate_history.json",
+        help="Path to persistent gate history used for default-flip readiness",
+    )
+    parser.add_argument(
+        "--required-consecutive-gate-passes",
+        type=int,
+        default=2,
+        help="Consecutive passing runs required before default flip",
+    )
+    parser.add_argument(
+        "--min-event-reduction-pct",
+        type=float,
+        default=50.0,
+        help="Gate threshold: minimum event reduction percent",
+    )
+    parser.add_argument(
+        "--min-repeat-reduction-pct",
+        type=float,
+        default=60.0,
+        help="Gate threshold: minimum repeated-command reduction percent",
+    )
     return parser.parse_args()
 
 
@@ -55,6 +82,8 @@ def _markdown_report(
     baseline_summary: Dict[str, Any],
     candidate_summary: Dict[str, Any],
     comparison: Dict[str, Any],
+    gates: Dict[str, Any] | None = None,
+    readiness: Dict[str, Any] | None = None,
 ) -> str:
     lines = [
         "# Harness Experiment Cycle Report",
@@ -105,6 +134,22 @@ def _markdown_report(
             d = row.get("delta", 0.0)
             lines.append(f"- {label}: {b} -> {c} ({d:+})")
 
+    if gates:
+        lines.extend(["", "## Hardening Gates"])
+        lines.append(f"- Passed: {gates.get('passed', False)}")
+        checks = gates.get("checks", {}) or {}
+        for key in ("quality_parity", "event_reduction", "repeat_reduction"):
+            row = checks.get(key, {})
+            lines.append(f"- {key}: {row.get('passed', False)}")
+
+    if readiness:
+        lines.extend(["", "## Default Flip Readiness"])
+        lines.append(f"- Ready to flip defaults: {readiness.get('ready_to_flip_defaults', False)}")
+        lines.append(
+            f"- Consecutive gate passes: {readiness.get('current_consecutive_passes', 0)}"
+            f"/{readiness.get('required_consecutive_passes', 2)}"
+        )
+
     return "\n".join(lines) + "\n"
 
 
@@ -116,11 +161,28 @@ def main() -> int:
     baseline_payload = analyze_trace_objects(baseline_traces)
     candidate_payload = analyze_trace_objects(candidate_traces)
     comparison = compare_analysis_payloads(baseline_payload, candidate_payload)
+    thresholds = GateThresholds(
+        min_event_reduction_pct=args.min_event_reduction_pct,
+        min_repeat_reduction_pct=args.min_repeat_reduction_pct,
+        required_consecutive_passes=args.required_consecutive_gate_passes,
+    )
+    gates = evaluate_hardening_gates(
+        baseline_traces=baseline_traces,
+        candidate_traces=candidate_traces,
+        thresholds=thresholds,
+    )
+    readiness = update_default_flip_readiness(
+        history_path=args.gate_history,
+        gate_result=gates,
+        required_consecutive_passes=args.required_consecutive_gate_passes,
+    )
 
     payload = {
         "baseline": baseline_payload,
         "candidate": candidate_payload,
         "comparison": comparison,
+        "gates": gates,
+        "default_flip_readiness": readiness,
     }
     Path(args.out_json).write_text(json.dumps(payload, indent=2, sort_keys=True))
     Path(args.out_md).write_text(
@@ -128,8 +190,13 @@ def main() -> int:
             baseline_summary=baseline_payload.get("summary", {}),
             candidate_summary=candidate_payload.get("summary", {}),
             comparison=comparison,
+            gates=gates,
+            readiness=readiness,
         )
     )
+    if args.out_gates:
+        Path(args.out_gates).write_text(json.dumps({"gates": gates, "default_flip_readiness": readiness}, indent=2, sort_keys=True))
+        print(f"Wrote {args.out_gates}")
     print(f"Wrote {args.out_json}")
     print(f"Wrote {args.out_md}")
     return 0

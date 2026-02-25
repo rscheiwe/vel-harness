@@ -8,7 +8,10 @@ import pytest
 from vel_harness.config import DeepAgentConfig
 from vel_harness.factory import DeepAgent
 from vel_harness.middleware.local_context import LocalContextMiddleware
-from vel_harness.middleware.tracing import TracingMiddleware
+from vel_harness.middleware.tracing import (
+    TELEMETRY_MODE_DEBUG,
+    TracingMiddleware,
+)
 from vel_harness.middleware.verification import VerificationMiddleware
 
 
@@ -92,8 +95,8 @@ async def test_run_stream_records_assistant_stream_events() -> None:
 
     assert out
     event_types = [e.event_type for e in tracing.events]
-    assert "assistant-generation" in event_types
-    assert "assistant-tool-call" in event_types
+    assert "assistant_step_summary" in event_types
+    assert "tool_call_summary" in event_types
     assert "assistant-finish" not in event_types
 
 
@@ -124,9 +127,43 @@ def test_stream_event_emits_generation_before_tool_call_in_step() -> None:
     tracing.end_run(success=True)
 
     event_types = [e.event_type for e in tracing.events]
-    gen_idx = event_types.index("assistant-generation")
-    tool_idx = event_types.index("assistant-tool-call")
+    gen_idx = event_types.index("assistant_step_summary")
+    tool_idx = event_types.index("tool_call_summary")
     assert gen_idx < tool_idx
+
+
+def test_stream_tool_output_nonzero_exit_is_failure_summary() -> None:
+    tracing = TracingMiddleware(enabled=True, emit_langfuse=False)
+    tracing.start_run("s-out-fail")
+    tracing.record_stream_event("s-out-fail", {"type": "start-step"})
+    tracing.record_stream_event(
+        "s-out-fail",
+        {"type": "tool-input-start", "toolCallId": "t1", "toolName": "execute_python"},
+    )
+    tracing.record_stream_event(
+        "s-out-fail",
+        {
+            "type": "tool-input-available",
+            "toolCallId": "t1",
+            "toolName": "execute_python",
+            "input": {"code": "print('x')"},
+        },
+    )
+    tracing.record_stream_event(
+        "s-out-fail",
+        {
+            "type": "tool-output-available",
+            "toolCallId": "t1",
+            "output": {"exit_code": 1, "success": False, "stderr": "Traceback ..."},
+        },
+    )
+    tracing.record_stream_event("s-out-fail", {"type": "finish"})
+    tracing.end_run(success=True)
+
+    summaries = [e for e in tracing.events if e.event_type == "tool_call_summary"]
+    assert summaries
+    assert summaries[-1].data.get("status") == "failure"
+    assert summaries[-1].data.get("error_type") == "ToolOutputFailure"
 
 
 @pytest.mark.asyncio
@@ -235,7 +272,24 @@ def test_tracing_emits_outputs_for_run_end_and_tools() -> None:
     tracing.record_tool_failure("execute", {"command": "pytest"}, "boom", 2.0, error_type="RuntimeError")
     tracing.end_run(success=True, data={"final_output_preview": "final answer"})
 
-    by_name = {c["name"]: c for c in fake.calls}
-    assert by_name["vel_harness.tool-success"]["output"] != ""
-    assert by_name["vel_harness.tool-failure"]["output"]["error"] == "boom"
-    assert by_name["vel_harness.run-end"]["output"] == "final answer"
+    summaries = [c for c in fake.calls if c.get("name") == "vel_harness.tool_call_summary"]
+    assert len(summaries) == 2
+    statuses = {c["output"]["status"] for c in summaries}
+    assert statuses == {"success", "failure"}
+    run_end = [c for c in fake.calls if c.get("name") == "vel_harness.run-end"][-1]
+    assert run_end["output"] == "final answer"
+
+
+def test_debug_telemetry_preserves_verbose_tool_events() -> None:
+    tracing = TracingMiddleware(
+        enabled=True,
+        emit_langfuse=False,
+        telemetry_mode=TELEMETRY_MODE_DEBUG,
+    )
+    tracing.start_run("s-debug")
+    tracing.record_tool_start("read_file", {"path": "README.md"})
+    tracing.record_tool_success("read_file", {"path": "README.md"}, 1.0, {"content": "ok"})
+    tracing.end_run(success=True)
+    event_types = [e.event_type for e in tracing.events]
+    assert "tool-start" in event_types
+    assert "tool-success" in event_types

@@ -61,6 +61,7 @@ class VelHarness:
         self,
         model: Dict[str, Any],
         tools: Optional[List[Any]] = None,
+        tool_input_rewriters: Optional[List[Callable[..., Any]]] = None,
         skill_dirs: Optional[List[Union[str, Path]]] = None,
         custom_agents: Optional[Dict[str, Union[AgentConfig, AgentDefinition, Dict[str, Any]]]] = None,
         system_prompt: Optional[str] = None,
@@ -92,6 +93,9 @@ class VelHarness:
                    - Callable: A function (auto-wrapped via ToolSpec.from_function())
                    Custom tools go through the full middleware pipeline
                    (hooks, caching, retry, checkpointing).
+            tool_input_rewriters: Optional list of callables that can rewrite
+                   tool input before execution. Use this for workspace-specific
+                   normalization without embedding domain logic in harness core.
             skill_dirs: Directories containing SKILL.md files
             custom_agents: Additional subagent configurations. Accepts:
                    - AgentConfig: Internal format
@@ -129,6 +133,7 @@ class VelHarness:
         """
         self._model = model
         self._custom_tools = tools or []
+        self._tool_input_rewriters = list(tool_input_rewriters or [])
         if web_search is None:
             web_search = bool(os.environ.get("TAVILY_API_KEY"))
         if web_search:
@@ -248,6 +253,13 @@ class VelHarness:
             if "working_dir" not in sandbox_dict:
                 sandbox_dict["working_dir"] = self._working_directory
 
+        entrypoint_only = os.environ.get("VH_SKILLS_ENTRYPOINT_ONLY", "1") != "0"
+        if os.environ.get("VH_SKILLS_LEGACY_SCAN") == "1":
+            entrypoint_only = False
+        if os.environ.get("VH_SKILLS_LEGACY_SCAN") == "0":
+            entrypoint_only = True
+        run_guard_enabled = os.environ.get("VH_RUN_GUARD_ENABLED", "1") != "0"
+
         config_dict = {
             "name": "vel-harness",
             "model": self._model,
@@ -260,6 +272,7 @@ class VelHarness:
                 "enabled": bool(self._skill_dirs),
                 "skill_dirs": self._skill_dirs,
                 "auto_activate": False,  # We use tool_result injection
+                "discovery_mode": "entrypoint_only" if entrypoint_only else "legacy_markdown_scan",
             },
             "subagents": {
                 "enabled": True,
@@ -276,7 +289,11 @@ class VelHarness:
             "local_context": {"enabled": True},
             "loop_detection": {"enabled": True},
             "verification": {"enabled": True, "strict": True, "max_followups": 2},
-            "tracing": {"enabled": True, "emit_langfuse": bool(os.environ.get("LANGFUSE_PUBLIC_KEY"))},
+            "tracing": {
+                "enabled": True,
+                "emit_langfuse": bool(os.environ.get("LANGFUSE_PUBLIC_KEY")),
+                "telemetry_mode": os.environ.get("VH_TELEMETRY_MODE", "standard"),
+            },
             "reasoning_scheduler": {
                 "enabled": True,
                 "planning_budget_tokens": 12000,
@@ -289,7 +306,7 @@ class VelHarness:
                 "hard_limit_seconds": 300,
             },
             "run_guard": {
-                "enabled": True,
+                "enabled": run_guard_enabled,
                 "max_tool_calls_total": 60,
                 "max_tool_calls_per_tool": {
                     "read_file": 30,
@@ -328,7 +345,9 @@ class VelHarness:
             config_dict["fallback_model"] = self._fallback_model
             config_dict["max_fallback_retries"] = self._max_fallback_retries
 
-        return DeepAgentConfig.from_dict(config_dict)
+        config = DeepAgentConfig.from_dict(config_dict)
+        config.tool_input_rewriters = list(self._tool_input_rewriters)
+        return config
 
     def _create_agent(self) -> DeepAgent:
         """Create the underlying DeepAgent with tool_result skill injection."""

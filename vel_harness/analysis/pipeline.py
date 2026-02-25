@@ -26,7 +26,7 @@ def analyze_trace_objects(traces: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Analyze trace objects into summary + per-run reports."""
     reports = []
     for trace in traces:
-        events = extract_event_stream(trace)
+        events = normalize_event_schema(extract_event_stream(trace))
         if not events:
             continue
         reports.append(classify_trace_failures(events))
@@ -52,3 +52,68 @@ def analyze_trace_objects(traces: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         ],
     }
 
+
+def normalize_event_schema(events: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalize mixed trace schemas into legacy-compatible events.
+
+    New compact schemas (e.g. tool_call_summary) are expanded to classic
+    tool-start/tool-success/tool-failure events so existing analysis logic
+    remains stable.
+    """
+    normalized: List[Dict[str, Any]] = []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        et = str(event.get("event_type", ""))
+        if et != "tool_call_summary":
+            normalized.append(event)
+            continue
+
+        data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+        tool_name = str(data.get("tool_name", ""))
+        tool_input = data.get("tool_input_preview", {})
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        base = {
+            "run_id": event.get("run_id", ""),
+            "session_id": event.get("session_id", ""),
+        }
+        seq = int(event.get("seq", 0))
+        normalized.append(
+            {
+                **base,
+                "seq": seq,
+                "event_type": "tool-start",
+                "data": {"tool_name": tool_name, "tool_input": tool_input},
+            }
+        )
+        if str(data.get("status", "")) == "failure":
+            normalized.append(
+                {
+                    **base,
+                    "seq": seq,
+                    "event_type": "tool-failure",
+                    "data": {
+                        "tool_name": tool_name,
+                        "tool_input": tool_input,
+                        "error": data.get("error", ""),
+                        "error_type": data.get("error_type", ""),
+                        "duration_ms": data.get("duration_ms", 0),
+                    },
+                }
+            )
+        else:
+            normalized.append(
+                {
+                    **base,
+                    "seq": seq,
+                    "event_type": "tool-success",
+                    "data": {
+                        "tool_name": tool_name,
+                        "tool_input": tool_input,
+                        "duration_ms": data.get("duration_ms", 0),
+                        "tool_output_preview": data.get("tool_output_preview", ""),
+                    },
+                }
+            )
+    return normalized

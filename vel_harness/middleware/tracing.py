@@ -8,6 +8,7 @@ Events are always stored in-memory for local debugging and tests.
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import time
 import uuid
@@ -22,6 +23,12 @@ _current_trace_run: contextvars.ContextVar[Optional[Dict[str, str]]] = contextva
     "vel_harness_trace_run",
     default=None,
 )
+
+
+TELEMETRY_MODE_MINIMAL = "minimal"
+TELEMETRY_MODE_STANDARD = "standard"
+TELEMETRY_MODE_DEBUG = "debug"
+EVENT_VERSION = 2
 
 
 @dataclass
@@ -43,15 +50,20 @@ class TracingMiddleware(BaseMiddleware):
         self,
         enabled: bool = True,
         emit_langfuse: bool = False,
+        telemetry_mode: str = TELEMETRY_MODE_STANDARD,
         stream_mode: str = "compact",
     ) -> None:
         self._enabled = enabled
         self._emit_langfuse = emit_langfuse
+        self._telemetry_mode = telemetry_mode
         self._stream_mode = stream_mode
         self._seq = 0
         self._events: List[TraceEvent] = []
         self._session_tool_calls: Dict[str, int] = {}
         self._stream_state: Dict[str, Dict[str, Any]] = {}
+        self._pending_tool_calls: Dict[str, Dict[str, Any]] = {}
+        self._tool_summary_seq = 0
+        self._recent_tool_summaries: Dict[str, Dict[str, Any]] = {}
         self._langfuse_client = self._create_langfuse_client() if emit_langfuse else None
 
     @property
@@ -75,6 +87,7 @@ class TracingMiddleware(BaseMiddleware):
             "text_chunks": [],
             "reasoning_chunks": [],
             "tool_inputs": {},
+            "saw_tool_boundary": False,
         }
         _current_trace_run.set(run_ctx)
         self.record("run-start", data={})
@@ -94,14 +107,22 @@ class TracingMiddleware(BaseMiddleware):
         """Record a structured event."""
         if not self._enabled:
             return
+        if (
+            self._telemetry_mode == TELEMETRY_MODE_MINIMAL
+            and event_type not in {"run-start", "run-end", "verification-followup-required"}
+        ):
+            return
         self._seq += 1
         ctx = _current_trace_run.get() or {}
+        payload = dict(data or {})
+        payload.setdefault("event_version", EVENT_VERSION)
+        payload.setdefault("telemetry_mode", self._telemetry_mode)
         event = TraceEvent(
             seq=self._seq,
             event_type=event_type,
             run_id=ctx.get("run_id", ""),
             session_id=ctx.get("session_id", ""),
-            data=data or {},
+            data=payload,
         )
         self._events.append(event)
         self._emit_to_langfuse(event)
@@ -111,7 +132,17 @@ class TracingMiddleware(BaseMiddleware):
         sid = str(ctx.get("session_id", "") or "")
         if sid:
             self._session_tool_calls[sid] = self._session_tool_calls.get(sid, 0) + 1
-        self.record("tool-start", {"tool_name": tool_name, "tool_input": tool_input})
+        if self._telemetry_mode == TELEMETRY_MODE_DEBUG:
+            self.record("tool-start", {"tool_name": tool_name, "tool_input": tool_input})
+            return
+        if self._telemetry_mode == TELEMETRY_MODE_MINIMAL:
+            return
+        call_key = self._build_call_key(tool_name, tool_input)
+        self._pending_tool_calls[call_key] = {
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+            "started_at": time.time(),
+        }
 
     def record_tool_success(
         self,
@@ -120,14 +151,27 @@ class TracingMiddleware(BaseMiddleware):
         duration_ms: float,
         tool_output: Any = None,
     ) -> None:
-        self.record(
-            "tool-success",
-            {
-                "tool_name": tool_name,
-                "tool_input": tool_input,
-                "duration_ms": duration_ms,
-                "tool_output_preview": self._preview_payload(tool_output),
-            },
+        if self._telemetry_mode == TELEMETRY_MODE_DEBUG:
+            self.record(
+                "tool-success",
+                {
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    "duration_ms": duration_ms,
+                    "tool_output_preview": self._preview_payload(tool_output),
+                },
+            )
+            return
+        if self._telemetry_mode == TELEMETRY_MODE_MINIMAL:
+            return
+        self._record_tool_call_summary(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            status="success",
+            duration_ms=duration_ms,
+            tool_output=tool_output,
+            error="",
+            error_type="",
         )
 
     def record_tool_failure(
@@ -138,15 +182,28 @@ class TracingMiddleware(BaseMiddleware):
         duration_ms: float,
         error_type: str = "",
     ) -> None:
-        self.record(
-            "tool-failure",
-            {
-                "tool_name": tool_name,
-                "tool_input": tool_input,
-                "error": error,
-                "error_type": error_type,
-                "duration_ms": duration_ms,
-            },
+        if self._telemetry_mode == TELEMETRY_MODE_DEBUG:
+            self.record(
+                "tool-failure",
+                {
+                    "tool_name": tool_name,
+                    "tool_input": tool_input,
+                    "error": error,
+                    "error_type": error_type,
+                    "duration_ms": duration_ms,
+                },
+            )
+            return
+        if self._telemetry_mode == TELEMETRY_MODE_MINIMAL:
+            return
+        self._record_tool_call_summary(
+            tool_name=tool_name,
+            tool_input=tool_input,
+            status="failure",
+            duration_ms=duration_ms,
+            tool_output=None,
+            error=error,
+            error_type=error_type,
         )
 
     def has_tool_calls(self, session_id: str) -> bool:
@@ -156,7 +213,12 @@ class TracingMiddleware(BaseMiddleware):
         """Record normalized stream events in ordered timeline."""
         if not self._enabled or not isinstance(event, dict):
             return
+        if self._telemetry_mode == TELEMETRY_MODE_MINIMAL:
+            return
         stream_type = str(event.get("type", "unknown"))
+        if self._telemetry_mode == TELEMETRY_MODE_STANDARD:
+            self._record_stream_compact(session_id, event)
+            return
         if self._stream_mode == "compact":
             self._record_stream_compact(session_id, event)
             return
@@ -192,14 +254,17 @@ class TracingMiddleware(BaseMiddleware):
                 "text_chunks": [],
                 "reasoning_chunks": [],
                 "tool_inputs": {},
+                "saw_tool_boundary": False,
             },
         )
 
         if stream_type == "start-step":
-            self._flush_generation_segment(session_id, trigger="start-step")
+            if self._telemetry_mode != TELEMETRY_MODE_STANDARD:
+                self._flush_generation_segment(session_id, trigger="start-step")
             state["step_index"] = int(state.get("step_index", 0)) + 1
             state["segment_index"] = 0
             state["tool_inputs"] = {}
+            state["saw_tool_boundary"] = False
             return
 
         if stream_type == "text-delta":
@@ -211,13 +276,14 @@ class TracingMiddleware(BaseMiddleware):
             return
 
         if stream_type in {"tool-input-start", "tool-call", "tool-call-start"}:
-            self._flush_generation_segment(session_id, trigger="tool-boundary")
+            state["saw_tool_boundary"] = True
             tool_call_id = str(event.get("toolCallId", event.get("tool_call_id", "")))
             if tool_call_id:
                 tool_inputs = state.setdefault("tool_inputs", {})
                 tool_inputs[tool_call_id] = {
                     "tool_name": str(event.get("toolName", event.get("tool_name", ""))),
                     "input_deltas": [],
+                    "parsed_input": {},
                 }
             return
 
@@ -225,12 +291,15 @@ class TracingMiddleware(BaseMiddleware):
             tool_call_id = str(event.get("toolCallId", event.get("tool_call_id", "")))
             if tool_call_id:
                 tool_inputs = state.setdefault("tool_inputs", {})
-                ti = tool_inputs.setdefault(tool_call_id, {"tool_name": "", "input_deltas": []})
+                ti = tool_inputs.setdefault(
+                    tool_call_id,
+                    {"tool_name": "", "input_deltas": [], "parsed_input": {}},
+                )
                 ti.setdefault("input_deltas", []).append(str(event.get("inputTextDelta", "")))
             return
 
         if stream_type == "tool-input-available":
-            self._flush_generation_segment(session_id, trigger="tool-boundary")
+            state["saw_tool_boundary"] = True
             tool_call_id = str(event.get("toolCallId", event.get("tool_call_id", "")))
             tool_name = str(event.get("toolName", event.get("tool_name", "")))
             payload_input = event.get("input")
@@ -245,38 +314,81 @@ class TracingMiddleware(BaseMiddleware):
                         payload_input = {"raw_input": raw}
                 if not tool_name:
                     tool_name = str(ti.get("tool_name", ""))
-            self.record(
-                "assistant-tool-call",
-                {
-                    "stream_type": stream_type,
-                    "step_index": int(state.get("step_index", 0)),
-                    "tool_call_id": tool_call_id,
-                    "tool_name": tool_name,
-                    "tool_input": payload_input or {},
-                },
-            )
+                ti["parsed_input"] = payload_input or {}
+            elif tool_call_id:
+                tool_inputs = state.setdefault("tool_inputs", {})
+                ti = tool_inputs.setdefault(
+                    tool_call_id,
+                    {"tool_name": tool_name, "input_deltas": [], "parsed_input": {}},
+                )
+                ti["parsed_input"] = payload_input or {}
+            if self._telemetry_mode == TELEMETRY_MODE_DEBUG:
+                self.record(
+                    "assistant-tool-call",
+                    {
+                        "stream_type": stream_type,
+                        "step_index": int(state.get("step_index", 0)),
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "tool_input": payload_input or {},
+                    },
+                )
             return
 
         if stream_type == "tool-output-available":
             tool_call_id = str(event.get("toolCallId", event.get("tool_call_id", "")))
             tool_name = ""
+            tool_input: Dict[str, Any] = {}
             if tool_call_id:
-                tool_name = str(
-                    state.setdefault("tool_inputs", {}).get(tool_call_id, {}).get("tool_name", "")
+                tool_meta = state.setdefault("tool_inputs", {}).get(tool_call_id, {})
+                tool_name = str(tool_meta.get("tool_name", ""))
+                parsed_input = tool_meta.get("parsed_input", {})
+                if isinstance(parsed_input, dict):
+                    tool_input = parsed_input
+            if self._telemetry_mode == TELEMETRY_MODE_STANDARD and not self.has_tool_calls(session_id):
+                output = event.get("output")
+                status = "success"
+                error = ""
+                error_type = ""
+                if isinstance(output, dict):
+                    out_success = output.get("success")
+                    out_exit_code = output.get("exit_code")
+                    out_status = str(output.get("status", "")).strip().lower()
+                    if (
+                        (isinstance(out_success, bool) and not out_success)
+                        or (isinstance(out_exit_code, int) and out_exit_code != 0)
+                        or out_status in {"error", "failed", "failure"}
+                    ):
+                        status = "failure"
+                        error = str(output.get("error") or output.get("stderr") or "")
+                        if isinstance(out_exit_code, int) and out_exit_code != 0 and not error:
+                            error = f"non-zero exit_code={out_exit_code}"
+                        error_type = "ToolOutputFailure"
+                self._record_tool_call_summary(
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    status=status,
+                    duration_ms=0.0,
+                    tool_output=output,
+                    error=error,
+                    error_type=error_type,
                 )
-            self.record(
-                "assistant-tool-result",
-                {
-                    "stream_type": stream_type,
-                    "step_index": int(state.get("step_index", 0)),
-                    "tool_call_id": tool_call_id,
-                    "tool_name": tool_name,
-                    "tool_output_preview": self._preview_payload(event.get("output"), max_chars=2000),
-                },
-            )
+            if self._telemetry_mode == TELEMETRY_MODE_DEBUG:
+                self.record(
+                    "assistant-tool-result",
+                    {
+                        "stream_type": stream_type,
+                        "step_index": int(state.get("step_index", 0)),
+                        "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,
+                        "tool_output_preview": self._preview_payload(event.get("output"), max_chars=2000),
+                    },
+                )
             return
 
         if stream_type == "finish-step":
+            if self._telemetry_mode == TELEMETRY_MODE_STANDARD:
+                return
             self._flush_generation_segment(session_id, trigger="finish-step")
             return
 
@@ -292,26 +404,42 @@ class TracingMiddleware(BaseMiddleware):
         reasoning = "".join(state.get("reasoning_chunks", []))
         if not text and not reasoning:
             return
-        self.record(
-            "assistant-generation",
-            {
-                "step_index": int(state.get("step_index", 0)),
-                "segment_index": int(state.get("segment_index", 0)),
-                "trigger": trigger,
-                "text_chars": len(text),
-                "text_preview": text[:6000],
-                "reasoning_chars": len(reasoning),
-                "reasoning_preview": reasoning[:3000],
-            },
-        )
+        if self._telemetry_mode == TELEMETRY_MODE_STANDARD:
+            self.record(
+                "assistant_step_summary",
+                {
+                    "step_index": int(state.get("step_index", 0)),
+                    "segment_index": int(state.get("segment_index", 0)),
+                    "trigger": trigger,
+                    "reasoning_phase": "reasoning" if reasoning else "response",
+                    "text_tokens": self._estimate_tokens(text),
+                    "tool_intent": "tool" if bool(state.get("saw_tool_boundary")) else "none",
+                    "step_duration_ms": 0,
+                },
+            )
+        else:
+            self.record(
+                "assistant-generation",
+                {
+                    "step_index": int(state.get("step_index", 0)),
+                    "segment_index": int(state.get("segment_index", 0)),
+                    "trigger": trigger,
+                    "text_chars": len(text),
+                    "text_preview": text[:6000],
+                    "reasoning_chars": len(reasoning),
+                    "reasoning_preview": reasoning[:3000],
+                },
+            )
         state["segment_index"] = int(state.get("segment_index", 0)) + 1
         state["text_chunks"] = []
         state["reasoning_chunks"] = []
+        state["saw_tool_boundary"] = False
 
     def get_state(self) -> Dict[str, Any]:
         return {
             "enabled": self._enabled,
             "emit_langfuse": self._emit_langfuse,
+            "telemetry_mode": self._telemetry_mode,
             "seq": self._seq,
             "events": [asdict(e) for e in self._events[-1000:]],
         }
@@ -319,6 +447,7 @@ class TracingMiddleware(BaseMiddleware):
     def load_state(self, state: Dict[str, Any]) -> None:
         self._enabled = bool(state.get("enabled", True))
         self._emit_langfuse = bool(state.get("emit_langfuse", False))
+        self._telemetry_mode = str(state.get("telemetry_mode", TELEMETRY_MODE_STANDARD))
         self._seq = int(state.get("seq", 0))
         restored = state.get("events", [])
         self._events = [
@@ -427,7 +556,78 @@ class TracingMiddleware(BaseMiddleware):
                 "error": event.data.get("error"),
                 "error_type": event.data.get("error_type"),
             }
+        if event.event_type == "tool_call_summary":
+            return {
+                "status": event.data.get("status"),
+                "duration_ms": event.data.get("duration_ms"),
+                "error_type": event.data.get("error_type"),
+            }
         return None
+
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return max(1, int(len(text) / 4))
+
+    def _fingerprint_payload(self, payload: Any) -> str:
+        try:
+            raw = json.dumps(payload, default=str, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            raw = str(payload)
+        return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    def _build_call_key(self, tool_name: str, tool_input: Dict[str, Any]) -> str:
+        return f"{tool_name}:{self._fingerprint_payload(tool_input)}"
+
+    def _summarize_tool_input(self, tool_input: Dict[str, Any]) -> Any:
+        serialized = self._preview_payload(tool_input, max_chars=2000)
+        if len(serialized) <= 512:
+            return tool_input
+        return {"fingerprint_only": True}
+
+    def _record_tool_call_summary(
+        self,
+        tool_name: str,
+        tool_input: Dict[str, Any],
+        status: str,
+        duration_ms: float,
+        tool_output: Any,
+        error: str,
+        error_type: str,
+    ) -> None:
+        call_key = self._build_call_key(tool_name, tool_input)
+        self._tool_summary_seq += 1
+        call_id = f"call_{self._tool_summary_seq}"
+        input_fingerprint = self._fingerprint_payload(tool_input)
+        output_fingerprint = self._fingerprint_payload(tool_output) if tool_output is not None else ""
+        retry_of_call_id = None
+        retry_reason = ""
+        prev = self._recent_tool_summaries.get(call_key)
+        if prev is not None:
+            retry_of_call_id = prev.get("call_id")
+            retry_reason = (
+                "timeout" if "timeout" in (error or "").lower() else ("error" if status == "failure" else "repeat")
+            )
+
+        self.record(
+            "tool_call_summary",
+            {
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "status": status,
+                "duration_ms": duration_ms,
+                "input_fingerprint": input_fingerprint,
+                "output_fingerprint": output_fingerprint,
+                "error_type": error_type,
+                "error": error if status == "failure" else "",
+                "tool_input_preview": self._summarize_tool_input(tool_input),
+                "tool_output_preview": self._preview_payload(tool_output, max_chars=1000) if tool_output is not None else "",
+                "retry_of_call_id": retry_of_call_id,
+                "retry_reason": retry_reason,
+            },
+        )
+        self._recent_tool_summaries[call_key] = {"call_id": call_id}
+        self._pending_tool_calls.pop(call_key, None)
 
     def _preview_payload(self, payload: Any, max_chars: int = 6000) -> str:
         if payload is None:

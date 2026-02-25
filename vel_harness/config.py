@@ -6,7 +6,7 @@ Configuration classes for deep agent creation.
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 
 if TYPE_CHECKING:
     from vel_harness.reasoning import ReasoningConfig
@@ -75,6 +75,7 @@ class SkillsConfig:
     skill_dirs: List[str] = field(default_factory=list)
     auto_activate: bool = True
     max_active_skills: int = 5
+    discovery_mode: str = "entrypoint_only"
 
 
 @dataclass
@@ -202,6 +203,7 @@ class TracingConfig:
 
     enabled: bool = True
     emit_langfuse: bool = False
+    telemetry_mode: str = "standard"
 
 
 @dataclass
@@ -253,6 +255,14 @@ class RunGuardConfig:
     ])
     completion_required_paths: List[str] = field(default_factory=list)
     completion_required_patterns: List[str] = field(default_factory=list)
+    max_discovery_rounds_by_class: Dict[str, int] = field(default_factory=lambda: {
+        "data_retrieval": 4,
+        "workflow_resolution": 4,
+        "code_change": 4,
+        "general": 3,
+    })
+    max_repeated_identical_execute: int = 3
+    enforce_query_evidence_for_numeric_claims: bool = True
 
 
 @dataclass
@@ -283,6 +293,7 @@ class DeepAgentConfig:
     name: str = "deep-agent"
     model: ModelConfig = field(default_factory=ModelConfig)
     system_prompt: Optional[str] = None
+    tool_input_rewriters: List[Callable[..., Any]] = field(default_factory=list)
 
     # Middleware
     planning: PlanningConfig = field(default_factory=PlanningConfig)
@@ -404,6 +415,7 @@ class DeepAgentConfig:
                     skill_dirs=skills_data.get("skill_dirs", []),
                     auto_activate=skills_data.get("auto_activate", True),
                     max_active_skills=skills_data.get("max_active_skills", 5),
+                    discovery_mode=skills_data.get("discovery_mode", "entrypoint_only"),
                 )
             elif isinstance(skills_data, bool):
                 config.skills = SkillsConfig(enabled=skills_data)
@@ -532,6 +544,7 @@ class DeepAgentConfig:
                 config.tracing = TracingConfig(
                     enabled=t_data.get("enabled", True),
                     emit_langfuse=t_data.get("emit_langfuse", False),
+                    telemetry_mode=t_data.get("telemetry_mode", "standard"),
                 )
             elif isinstance(t_data, bool):
                 config.tracing = TracingConfig(enabled=t_data)
@@ -583,6 +596,14 @@ class DeepAgentConfig:
                     verification_tool_names=rg_data.get("verification_tool_names", RunGuardConfig().verification_tool_names),
                     completion_required_paths=rg_data.get("completion_required_paths", []),
                     completion_required_patterns=rg_data.get("completion_required_patterns", []),
+                    max_discovery_rounds_by_class=rg_data.get(
+                        "max_discovery_rounds_by_class",
+                        RunGuardConfig().max_discovery_rounds_by_class,
+                    ),
+                    max_repeated_identical_execute=rg_data.get("max_repeated_identical_execute", 3),
+                    enforce_query_evidence_for_numeric_claims=rg_data.get(
+                        "enforce_query_evidence_for_numeric_claims", True
+                    ),
                 )
             elif isinstance(rg_data, bool):
                 config.run_guard = RunGuardConfig(enabled=rg_data)
@@ -635,6 +656,8 @@ class DeepAgentConfig:
                 "enabled": self.skills.enabled,
                 "skill_dirs": self.skills.skill_dirs,
                 "auto_activate": self.skills.auto_activate,
+                "max_active_skills": self.skills.max_active_skills,
+                "discovery_mode": self.skills.discovery_mode,
             },
             "subagents": {
                 "enabled": self.subagents.enabled,
@@ -688,6 +711,7 @@ class DeepAgentConfig:
             "tracing": {
                 "enabled": self.tracing.enabled,
                 "emit_langfuse": self.tracing.emit_langfuse,
+                "telemetry_mode": self.tracing.telemetry_mode,
             },
             "reasoning": {
                 "mode": self.reasoning.mode if self.reasoning else "none",
@@ -715,6 +739,11 @@ class DeepAgentConfig:
                 "verification_tool_names": self.run_guard.verification_tool_names,
                 "completion_required_paths": self.run_guard.completion_required_paths,
                 "completion_required_patterns": self.run_guard.completion_required_patterns,
+                "max_discovery_rounds_by_class": self.run_guard.max_discovery_rounds_by_class,
+                "max_repeated_identical_execute": self.run_guard.max_repeated_identical_execute,
+                "enforce_query_evidence_for_numeric_claims": (
+                    self.run_guard.enforce_query_evidence_for_numeric_claims
+                ),
             },
             "fallback_model": self.fallback_model,
             "max_fallback_retries": self.max_fallback_retries,

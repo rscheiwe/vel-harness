@@ -8,10 +8,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from vel_harness.skills.loader import (
+    DISCOVERY_MODE_ENTRYPOINT_ONLY,
     Skill,
+    SkillAsset,
     load_skill,
-    load_skills_from_directories,
-    load_skills_from_directory,
+    load_skill_inventory_from_directory,
 )
 
 
@@ -30,6 +31,7 @@ class SkillsRegistry:
         self,
         skill_dirs: Optional[List[str]] = None,
         auto_load: bool = True,
+        discovery_mode: str = DISCOVERY_MODE_ENTRYPOINT_ONLY,
     ) -> None:
         """
         Initialize skills registry.
@@ -39,8 +41,12 @@ class SkillsRegistry:
             auto_load: Whether to load skills immediately
         """
         self._skills: Dict[str, Skill] = {}
+        self._assets: List[SkillAsset] = []
+        self._assets_by_skill: Dict[str, List[SkillAsset]] = {}
+        self._ambiguous_skills: Dict[str, List[Skill]] = {}
         self._active_skills: Set[str] = set()
         self._skill_dirs = [Path(d) for d in (skill_dirs or [])]
+        self._discovery_mode = discovery_mode
 
         if auto_load and self._skill_dirs:
             self.load_from_directories()
@@ -54,6 +60,11 @@ class SkillsRegistry:
     def enabled_skills(self) -> List[Skill]:
         """Get all enabled skills."""
         return [s for s in self._skills.values() if s.enabled]
+
+    @property
+    def assets(self) -> List[SkillAsset]:
+        """Get all knowledge assets."""
+        return list(self._assets)
 
     @property
     def active_skills(self) -> List[Skill]:
@@ -71,12 +82,34 @@ class SkillsRegistry:
             Number of skills loaded
         """
         dirs = directories or self._skill_dirs
-        skills = load_skills_from_directories(dirs)
+        if directories is None:
+            self._skills = {}
+            self._assets = []
+            self._assets_by_skill = {}
+            self._ambiguous_skills = {}
+        loaded_count = 0
+        for directory in dirs:
+            skills, assets = load_skill_inventory_from_directory(
+                directory,
+                discovery_mode=self._discovery_mode,
+            )
+            for skill in skills:
+                existing = self._skills.get(skill.name)
+                if existing and existing.source_path != skill.source_path:
+                    if skill.name not in self._ambiguous_skills:
+                        self._ambiguous_skills[skill.name] = [existing, skill]
+                    else:
+                        self._ambiguous_skills[skill.name].append(skill)
+                    continue
+                self._skills[skill.name] = skill
+                loaded_count += 1
 
-        for skill in skills:
-            self._skills[skill.name] = skill
+            for asset in assets:
+                self._assets.append(asset)
+                if asset.skill_name:
+                    self._assets_by_skill.setdefault(asset.skill_name, []).append(asset)
 
-        return len(skills)
+        return loaded_count
 
     def load_skill(self, path: str) -> Skill:
         """
@@ -199,10 +232,29 @@ class SkillsRegistry:
         Returns:
             True if skill was found and activated
         """
+        if name in self._ambiguous_skills:
+            return False
         if name in self._skills and self._skills[name].enabled:
             self._active_skills.add(name)
             return True
         return False
+
+    def get_activation_error(self, name: str) -> Optional[str]:
+        """Return deterministic activation error if activation is blocked."""
+        if name in self._ambiguous_skills:
+            candidates = sorted(
+                skill.source_path or "<unknown>"
+                for skill in self._ambiguous_skills[name]
+            )
+            return (
+                f"Skill '{name}' is ambiguous. "
+                f"Candidate entrypoints: {candidates}"
+            )
+        if name not in self._skills:
+            return f"Skill '{name}' not found"
+        if not self._skills[name].enabled:
+            return f"Skill '{name}' is disabled"
+        return None
 
     def deactivate_skill(self, name: str) -> bool:
         """
@@ -301,17 +353,27 @@ Follow the instructions in the skill above."""
             for skill in self._skills.values()
         ]
 
+    def list_skill_assets(self, skill_name: str) -> List[Dict[str, Any]]:
+        """List knowledge assets associated with a skill."""
+        return [asset.to_dict() for asset in self._assets_by_skill.get(skill_name, [])]
+
     def get_state(self) -> Dict[str, Any]:
         """Get registry state for persistence."""
         return {
             "skill_dirs": [str(d) for d in self._skill_dirs],
             "active_skills": list(self._active_skills),
+            "discovery_mode": self._discovery_mode,
         }
 
     def load_state(self, state: Dict[str, Any]) -> None:
         """Load registry state from persistence."""
         self._skill_dirs = [Path(d) for d in state.get("skill_dirs", [])]
         self._active_skills = set(state.get("active_skills", []))
+        self._discovery_mode = state.get("discovery_mode", self._discovery_mode)
+        self._skills = {}
+        self._assets = []
+        self._assets_by_skill = {}
+        self._ambiguous_skills = {}
 
         # Reload skills
         if self._skill_dirs:

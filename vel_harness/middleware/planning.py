@@ -7,7 +7,7 @@ Mirrors Claude Code's planning behavior.
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from vel import ToolSpec
 
@@ -206,12 +206,31 @@ Always create a plan before starting complex work.
             ),
         ]
 
+    @staticmethod
+    def _coerce_list_items(raw: Optional[Union[List[str], str]]) -> List[str]:
+        """Coerce model-provided list-like inputs into a list of strings."""
+        if raw is None:
+            return []
+        if isinstance(raw, list):
+            return [str(item).strip() for item in raw if str(item).strip()]
+        if isinstance(raw, str):
+            lines = [line.strip() for line in raw.splitlines()]
+            items: List[str] = []
+            for line in lines:
+                if not line:
+                    continue
+                if line.startswith("- "):
+                    line = line[2:].strip()
+                items.append(line)
+            return [item for item in items if item]
+        return []
+
     def write_todos(
         self,
         current_task: str,
-        next_steps: Optional[List[str]] = None,
-        completed: Optional[List[str]] = None,
-        in_progress: Optional[List[str]] = None,
+        next_steps: Optional[Union[List[str], str]] = None,
+        completed: Optional[Union[List[str], str]] = None,
+        in_progress: Optional[Union[List[str], str]] = None,
         blocked: Optional[List[Dict[str, str]]] = None,
     ) -> Dict[str, Any]:
         """
@@ -232,8 +251,9 @@ Always create a plan before starting complex work.
 
         # Mark completed
         completed_items: List[Dict[str, Any]] = []
-        if completed:
-            for todo_id in completed:
+        completed_ids = self._coerce_list_items(completed)
+        if completed_ids:
+            for todo_id in completed_ids:
                 if self.todo_list.complete(todo_id):
                     item = self.todo_list.get_by_id(todo_id)
                     if item:
@@ -241,8 +261,9 @@ Always create a plan before starting complex work.
 
         # Mark in progress
         started_items: List[Dict[str, Any]] = []
-        if in_progress:
-            for todo_id in in_progress:
+        in_progress_ids = self._coerce_list_items(in_progress)
+        if in_progress_ids:
+            for todo_id in in_progress_ids:
                 if self.todo_list.start(todo_id):
                     item = self.todo_list.get_by_id(todo_id)
                     if item:
@@ -261,8 +282,9 @@ Always create a plan before starting complex work.
 
         # Add new steps
         new_items: List[Dict[str, Any]] = []
-        if next_steps:
-            for step in next_steps:
+        next_steps_items = self._coerce_list_items(next_steps)
+        if next_steps_items:
+            for step in next_steps_items:
                 item = self.todo_list.add(step)
                 new_items.append(item.to_dict())
 

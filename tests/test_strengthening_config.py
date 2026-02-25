@@ -31,6 +31,9 @@ def test_strengthening_config_roundtrip() -> None:
                 "max_tool_calls_total": 9,
                 "max_same_tool_input_repeats": 2,
                 "max_failure_streak": 4,
+                "max_discovery_rounds_by_class": {"data_retrieval": 1, "general": 2},
+                "max_repeated_identical_execute": 2,
+                "enforce_query_evidence_for_numeric_claims": True,
             },
         }
     )
@@ -39,6 +42,10 @@ def test_strengthening_config_roundtrip() -> None:
     assert d["loop_detection"]["file_edit_threshold"] == 7
     assert d["verification"]["max_followups"] == 2
     assert d["tracing"]["enabled"] is True
+    assert d["tracing"]["telemetry_mode"] == "standard"
     assert d["reasoning_scheduler"]["verify_budget_tokens"] == 333
     assert d["run_guard"]["max_tool_calls_total"] == 9
     assert d["run_guard"]["max_same_tool_input_repeats"] == 2
+    assert d["run_guard"]["max_discovery_rounds_by_class"]["data_retrieval"] == 1
+    assert d["run_guard"]["max_repeated_identical_execute"] == 2
+    assert d["run_guard"]["enforce_query_evidence_for_numeric_claims"] is True

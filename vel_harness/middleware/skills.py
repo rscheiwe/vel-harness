@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional
 from vel import ToolSpec
 
 from vel_harness.middleware.base import BaseMiddleware
+from vel_harness.skills.loader import DISCOVERY_MODE_ENTRYPOINT_ONLY
 from vel_harness.skills.registry import SkillsRegistry
 
 
@@ -48,6 +49,7 @@ class SkillsMiddleware(BaseMiddleware):
         skill_dirs: Optional[List[str]] = None,
         auto_activate: bool = True,
         max_active_skills: int = 5,
+        discovery_mode: str = DISCOVERY_MODE_ENTRYPOINT_ONLY,
         injection_mode: SkillInjectionMode = SkillInjectionMode.TOOL_RESULT,
     ) -> None:
         """
@@ -57,9 +59,13 @@ class SkillsMiddleware(BaseMiddleware):
             skill_dirs: Directories to load skills from
             auto_activate: Whether to auto-activate skills based on context
             max_active_skills: Maximum number of simultaneously active skills
+            discovery_mode: Skill discovery mode
             injection_mode: How skill content is delivered (TOOL_RESULT or SYSTEM_PROMPT)
         """
-        self._registry = SkillsRegistry(skill_dirs=skill_dirs)
+        self._registry = SkillsRegistry(
+            skill_dirs=skill_dirs,
+            discovery_mode=discovery_mode,
+        )
         self._auto_activate = auto_activate
         self._max_active_skills = max_active_skills
         self._injection_mode = injection_mode
@@ -148,6 +154,15 @@ class SkillsMiddleware(BaseMiddleware):
                 description=(
                     "Search for skills matching a query. Searches skill names, "
                     "descriptions, and tags."
+                ),
+                category="skills",
+            ),
+            ToolSpec.from_function(
+                self._list_skill_assets,
+                name="list_skill_assets",
+                description=(
+                    "List reference docs associated with a skill, including "
+                    "recipes/workflows/reference markdown files."
                 ),
                 category="skills",
             ),
@@ -249,7 +264,8 @@ class SkillsMiddleware(BaseMiddleware):
         """
         skill = self._registry.get_skill(name)
         if not skill:
-            return {"error": f"Skill '{name}' not found"}
+            message = self._registry.get_activation_error(name)
+            return {"error": message or f"Skill '{name}' not found"}
 
         if not skill.enabled:
             return {"error": f"Skill '{name}' is disabled"}
@@ -262,7 +278,9 @@ class SkillsMiddleware(BaseMiddleware):
             }
 
         # Mark as active (for tracking)
-        self._registry.activate_skill(name)
+        if not self._registry.activate_skill(name):
+            message = self._registry.get_activation_error(name)
+            return {"error": message or f"Skill '{name}' could not be activated"}
 
         # In TOOL_RESULT mode, return skill content directly
         if self._injection_mode == SkillInjectionMode.TOOL_RESULT:
@@ -346,6 +364,15 @@ class SkillsMiddleware(BaseMiddleware):
                 for s in skills
             ],
             "count": len(skills),
+        }
+
+    def _list_skill_assets(self, skill_name: str) -> Dict[str, Any]:
+        """List reference assets associated with a skill."""
+        assets = self._registry.list_skill_assets(skill_name)
+        return {
+            "skill": skill_name,
+            "assets": assets,
+            "count": len(assets),
         }
 
     def get_state(self) -> Dict[str, Any]:

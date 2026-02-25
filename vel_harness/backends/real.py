@@ -31,8 +31,9 @@ class RealFilesystemBackend:
     def _resolve_path(self, path: str) -> Path:
         """Resolve a path, optionally relative to base_path."""
         if self.base_path:
-            # Enforce all operations under base_path, even for absolute inputs.
-            candidate = (self.base_path / path.lstrip("/")).resolve()
+            raw = Path(path)
+            # Keep absolute paths absolute; resolve relative paths from base_path.
+            candidate = raw.resolve() if raw.is_absolute() else (self.base_path / raw).resolve()
             try:
                 candidate.relative_to(self.base_path)
             except ValueError:

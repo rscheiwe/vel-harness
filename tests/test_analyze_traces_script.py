@@ -31,3 +31,29 @@ def test_run_analysis_emits_summary() -> None:
     assert "summary" in out
     assert out["summary"]["runs_analyzed"] == 1
     assert "reports" in out
+
+
+def test_run_analysis_normalizes_tool_call_summary() -> None:
+    traces = [
+        {
+            "events": [
+                {"seq": 1, "event_type": "run-start", "run_id": "r2", "session_id": "s2", "data": {}},
+                {
+                    "seq": 2,
+                    "event_type": "tool_call_summary",
+                    "run_id": "r2",
+                    "session_id": "s2",
+                    "data": {
+                        "tool_name": "execute",
+                        "status": "success",
+                        "duration_ms": 2.5,
+                        "tool_input_preview": {"command": "pytest -q"},
+                    },
+                },
+                {"seq": 3, "event_type": "run-end", "run_id": "r2", "session_id": "s2", "data": {}},
+            ]
+        }
+    ]
+    out = run_analysis(traces)
+    assert out["summary"]["runs_analyzed"] == 1
+    assert out["reports"][0]["stats"]["tool_calls"] >= 1

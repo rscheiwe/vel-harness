@@ -51,6 +51,9 @@ def classify_trace_failures(events: Sequence[Dict[str, Any]]) -> TraceAnalysisRe
     todo_stats = _todo_stats(tool_events)
     parallel_stats = _parallel_stats(tool_events)
     verify_followups = [e for e in events if e.get("event_type") == "verification-followup-required"]
+    verification_gate_followups = [
+        e for e in verify_followups if str(e.get("data", {}).get("source", "")) == "verification"
+    ]
     behavior = _behavior_assessment(
         coding_intent=coding_intent,
         tool_events=tool_events,
@@ -67,7 +70,7 @@ def classify_trace_failures(events: Sequence[Dict[str, Any]]) -> TraceAnalysisRe
         "tool_failures": len(tool_failures),
         "coding_intent": coding_intent,
         "verification_calls": len(verification_events),
-        "verification_followups": len(verify_followups),
+        "verification_followups": len(verification_gate_followups),
         **todo_stats,
         **parallel_stats,
         "behavior": behavior,
@@ -125,13 +128,13 @@ def classify_trace_failures(events: Sequence[Dict[str, Any]]) -> TraceAnalysisRe
         )
 
     # premature_completion
-    if verify_followups:
+    if verification_gate_followups:
         report.findings.append(
             FailureFinding(
                 category="premature_completion",
                 severity="medium",
                 reason="Run attempted to finalize before verification pass.",
-                event_refs=[e.get("seq", 0) for e in verify_followups],
+                event_refs=[e.get("seq", 0) for e in verification_gate_followups],
             )
         )
 
@@ -260,7 +263,10 @@ def _has_coding_intent(events: Sequence[Dict[str, Any]]) -> bool:
     for event in events:
         et = event.get("event_type")
         if et == "verification-followup-required":
-            return True
+            source = str(event.get("data", {}).get("source", ""))
+            if source == "verification":
+                return True
+            continue
         if et in {"tool-start", "tool-success", "tool-failure"}:
             name = str(event.get("data", {}).get("tool_name", ""))
             data = event.get("data", {})

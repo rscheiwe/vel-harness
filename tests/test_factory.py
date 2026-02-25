@@ -21,6 +21,8 @@ from vel_harness.config import (
 )
 from vel_harness.factory import (
     DeepAgent,
+    _apply_tool_input_rewriters,
+    _is_tool_output_failure,
     create_deep_agent,
     create_research_agent,
     create_data_agent,
@@ -70,6 +72,48 @@ class TestModelConfig:
         assert d["provider"] == "anthropic"
         assert d["model"] == "claude-sonnet-4-5-20250929"
         assert d["temperature"] == 0.5
+
+
+def test_apply_tool_input_rewriters_applies_in_order() -> None:
+    def first(_tool: str, kwargs: dict[str, object], _wd: object) -> dict[str, object]:
+        out = dict(kwargs)
+        out["first"] = True
+        return out
+
+    def second(_tool: str, kwargs: dict[str, object], _wd: object) -> tuple[dict[str, object], str]:
+        out = dict(kwargs)
+        out["second"] = True
+        return out, "normalized-input"
+
+    out, reasons = _apply_tool_input_rewriters(
+        tool_name="execute_python",
+        kwargs={"code": "print(1)"},
+        working_dir="/tmp",
+        rewriters=[first, second],
+    )
+    assert out.get("first") is True
+    assert out.get("second") is True
+    assert reasons == ["normalized-input"]
+
+
+def test_apply_tool_input_rewriters_ignores_none() -> None:
+    out, reasons = _apply_tool_input_rewriters(
+        tool_name="execute_python",
+        kwargs={"code": "print(1)"},
+        working_dir="/tmp",
+        rewriters=[lambda *_: None],
+    )
+    assert out == {"code": "print(1)"}
+    assert reasons == []
+
+
+def test_is_tool_output_failure_uses_exit_code_and_success() -> None:
+    failed, error, error_type = _is_tool_output_failure(
+        {"exit_code": 1, "success": False, "stderr": "Traceback"}
+    )
+    assert failed is True
+    assert "Traceback" in error
+    assert error_type == "ToolOutputStderr"
 
 
 class TestDeepAgentConfig:

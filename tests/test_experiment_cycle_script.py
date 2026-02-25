@@ -29,3 +29,35 @@ def test_markdown_report_contains_verdict_and_totals() -> None:
     assert "no_verification" in md
     assert "Behavior Deltas" in md
     assert "Todo compliance rate" in md
+
+
+def test_markdown_report_includes_gate_sections() -> None:
+    md = _markdown_report(
+        baseline_summary={"recommendations": []},
+        candidate_summary={"recommendations": []},
+        comparison={
+            "verdict": "flat",
+            "baseline_total_failures": 1,
+            "candidate_total_failures": 1,
+            "total_failure_delta": 0,
+            "top_regressions": [],
+            "top_improvements": [],
+            "behavior_delta": {},
+        },
+        gates={
+            "passed": True,
+            "checks": {
+                "quality_parity": {"passed": True},
+                "event_reduction": {"passed": True},
+                "repeat_reduction": {"passed": True},
+            },
+        },
+        readiness={
+            "ready_to_flip_defaults": True,
+            "current_consecutive_passes": 2,
+            "required_consecutive_passes": 2,
+        },
+    )
+    assert "Hardening Gates" in md
+    assert "Default Flip Readiness" in md
+    assert "Ready to flip defaults: True" in md
